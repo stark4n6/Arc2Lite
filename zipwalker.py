@@ -34,6 +34,7 @@ def decode_extended_timestamp(extra_data):
 
 def main(zip_path,db_file_path):
     try:
+        db_file_path = db_file_path + '\\file_listing.db'
         with zipfile.ZipFile(zip_path, mode="r") as archive, sqlite3.connect(db_file_path) as conn:
             cursor = conn.cursor()
 
@@ -65,15 +66,15 @@ def main(zip_path,db_file_path):
                 if timestamps and 'ctime' in timestamps:
                     created_date = timestamps['ctime']
                 else:
-                    created_date = 'N/A'
+                    created_date = ''
                 if timestamps and 'atime' in timestamps:
                     accessed_date = timestamps['atime']
                 else:
-                    accessed_date = 'N/A'
+                    accessed_date = ''
                 if timestamps and 'mtime' in timestamps:
                     modified_date = timestamps['mtime']
                 else:
-                    modified_date = 'N/A'            
+                    modified_date = ''
                 
                 is_file = 1 if not path.endswith('/') else 0  # Check if it's a file
                 file_name = os.path.basename(path) if is_file else None
@@ -92,4 +93,4 @@ if __name__ == "__main__":
     parser.add_argument("zip_path", help="Path to the ZIP file")
     parser.add_argument("export_path", help="Path for the export report")
     args = parser.parse_args()
-    main(args.zip_path,args.export_path+'\file_listing.db')
+    main(args.zip_path,args.export_path)
