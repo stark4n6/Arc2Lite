@@ -4,6 +4,11 @@ import struct
 import argparse
 import os
 import sqlite3
+import time
+
+def is_platform_windows():
+    '''Returns True if running on Windows'''
+    return os.name == 'nt'
 
 def decode_extended_timestamp(extra_data):
     offset = 0
@@ -32,9 +37,31 @@ def decode_extended_timestamp(extra_data):
             offset += data_size
     return None
 
-def main(zip_path,db_file_path):
+def main(zip_path,export_path):
+    
+    base = "ZipWalker_Out_"
+    
+    if is_platform_windows():
+        if zip_path[1] == ':': zip_path = '\\\\?\\' + zip_path.replace('/', '\\')
+        if export_path[1] == ':': export_path = '\\\\?\\' + export_path.replace('/', '\\')
+        
+        if not export_path.endswith('\\'):
+            export_path = export_path + '\\'
+    
+    platform = is_platform_windows()
+    if platform:
+        splitter = '\\'
+    else:
+        splitter = '/' 
+    
+    output_ts = time.strftime("%Y%m%d-%H%M%S")
+    out_folder = export_path + base + output_ts
+    os.makedirs(out_folder)
+    
     try:
-        db_file_path = db_file_path + '\\file_listing.db'
+        
+        
+        db_file_path = out_folder + splitter + 'file_listing.db'
         with zipfile.ZipFile(zip_path, mode="r") as archive, sqlite3.connect(db_file_path) as conn:
             cursor = conn.cursor()
 
