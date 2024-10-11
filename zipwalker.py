@@ -59,13 +59,10 @@ def main(zip_path,export_path):
     os.makedirs(out_folder)
     
     try:
-        
-        
         db_file_path = out_folder + splitter + 'file_listing.db'
         with zipfile.ZipFile(zip_path, mode="r") as archive, sqlite3.connect(db_file_path) as conn:
+            
             cursor = conn.cursor()
-
-            # Create a table to store the paths with created, modified dates, file name, and extension
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS file_listing (
                     file_name TEXT,
@@ -82,7 +79,6 @@ def main(zip_path,export_path):
 
             for info in archive.infolist():
                 path = info.filename
-                #info = archive.getinfo(target_filename)
                 
                 size = info.file_size
                 comp_size = info.compress_size
