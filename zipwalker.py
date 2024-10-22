@@ -6,6 +6,19 @@ import os
 import sqlite3
 import time
 
+ascii_art = r'''
+     ______    __        __    _ _             
+    |__  (_)_ _\ \      / /_ _| | | _____ _ __ 
+      / /| | '_ \ \ /\ / / _` | | |/ / _ \ '__|
+     / /_| | |_) \ V  V / (_| | |   <  __/ |   
+    /____|_| .__/ \_/\_/ \__,_|_|_|\_\___|_|   
+           |_|
+
+               ZipWalker v0.0.1
+      https://github.com/stark4n6/ZipWalker
+ @KevinPagano3 | @stark4n6 | startme.stark4n6.com
+'''
+
 def is_platform_windows():
     '''Returns True if running on Windows'''
     return os.name == 'nt'
@@ -38,6 +51,14 @@ def decode_extended_timestamp(extra_data):
     return None
 
 def main(zip_path,export_path):
+    
+    print(ascii_art)
+    print()
+    
+    start_time = time.time()
+    print('Start: ' + str(datetime.datetime.now()))
+    print('Source: ' + zip_path)
+    print('Destination: ' + export_path)
     
     base = "ZipWalker_Out_"
     
@@ -111,8 +132,12 @@ def main(zip_path,export_path):
     except FileNotFoundError:
         print(f"ZIP file '{zip_path}' not found.")
         
+    print()
+    print('****JOB FINISHED****')
+    print('Runtime: %s seconds' % (time.time() - start_time))
+        
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Extract and print file timestamps from a ZIP archive.")
+    parser = argparse.ArgumentParser(description="ZipWalker v0.0.1 by @KevinPagano3 | @stark4n6 | https://github.com/stark4n6/ZipWalker")
     parser.add_argument("zip_path", help="Path to the ZIP file")
     parser.add_argument("export_path", help="Path for the export report")
     args = parser.parse_args()
