@@ -5,23 +5,24 @@ import argparse
 import os
 import sqlite3
 import time
+import csv
 
 ascii_art = r'''
-     ______    __        __    _ _             
-    |__  (_)_ _\ \      / /_ _| | | _____ _ __ 
-      / /| | '_ \ \ /\ / / _` | | |/ / _ \ '__|
-     / /_| | |_) \ V  V / (_| | |   <  __/ |   
-    /____|_| .__/ \_/\_/ \__,_|_|_|\_\___|_|   
-           |_|
+                 ______    __        __    _ _             
+                |__  (_)_ _\ \      / /_ _| | | _____ _ __ 
+                  / /| | '_ \ \ /\ / / _` | | |/ / _ \ '__|
+                 / /_| | |_) \ V  V / (_| | |   <  __/ |   
+                /____|_| .__/ \_/\_/ \__,_|_|_|\_\___|_|   
+                       |_|
 
-               ZipWalker v0.0.2
-      https://github.com/stark4n6/ZipWalker
- @KevinPagano3 | @stark4n6 | startme.stark4n6.com
+                           ZipWalker v0.0.2
+                  https://github.com/stark4n6/ZipWalker
+             @KevinPagano3 | @stark4n6 | startme.stark4n6.com
 '''
 
 splitter = '\\'
-global count
 count = 0
+files_found = []
 
 def is_platform_windows():
     '''Returns True if running on Windows'''
@@ -54,23 +55,33 @@ def decode_extended_timestamp(extra_data):
             offset += data_size
     return None
     
-def check_input(input_path,out_folder,count):
-    if os.path.isdir(input_path):
-        for root, dirs, files in os.walk(input_path):
-            for file in files:
-                if file.endswith(".zip"):
-                    zip_file_path = os.path.join(root, file)
-                    print(f"Found ZIP file: {zip_file_path}")
-                    process_input(zip_file_path,out_folder,count)
-                    count += 1
+def check_input(input_path,out_folder):
+    global count
+    global files_found
+    
+    if os.path.isdir(out_folder):
+        if os.path.isdir(input_path):
+            for root, dirs, files in os.walk(input_path):
+                for file in files:
+                    if file.endswith(".zip"):
+                        zip_file_path = os.path.join(root, file)
+                        print(f"Found ZIP file: {zip_file_path}")
+                        print()
+                        process_input(zip_file_path,out_folder)
+                        count += 1
+                        files_found.append((zip_file_path,str(count) + '-' + os.path.basename(zip_file_path) + '_file_listing.db'))
         
-    elif zipfile.is_zipfile(input_path):
-        print(f"Processing ZIP file: {input_path}")
-        process_input(input_path,out_folder,count)
+        elif zipfile.is_zipfile(input_path):
+            print(f"Processing ZIP file: {input_path}")
+            process_input(input_path,out_folder)
+            files_found.append((input_path,os.path.basename(input_path) + '_file_listing.db'))
+        else:
+            print("Unknown input type, please make sure your input contains ZIP files.")
     else:
-        print("Unknown input type, please make sure your input contains ZIP files.")
-  
-def process_input(input_path,out_folder,count):
+        print("Output path is not a folder, please run again.")
+    
+def process_input(input_path,out_folder):
+    global count
     try:
         db_file_path = out_folder + splitter + str(count) + '-' + os.path.basename(input_path) + '_file_listing.db'
         with zipfile.ZipFile(input_path, mode="r") as archive, sqlite3.connect(db_file_path) as conn:
@@ -125,6 +136,8 @@ def process_input(input_path,out_folder,count):
         print(f"ZIP file '{input_path}' not found.")
         
 def main(input_path,export_path):
+    global count
+    global files_found
     
     print(ascii_art)
     print()
@@ -154,7 +167,12 @@ def main(input_path,export_path):
     out_folder = export_path + base + output_ts
     os.makedirs(out_folder)
     
-    check_input(input_path,out_folder,count)
+    check_input(input_path,out_folder)
+    
+    with open(out_folder + splitter + "Zips.csv", 'w', newline='') as csvfile:
+        csv_writer = csv.writer(csvfile)
+        csv_writer.writerow(('Input Path','Exported File Listing'))
+        csv_writer.writerows(files_found)
         
     print()
     print('****JOB FINISHED****')
