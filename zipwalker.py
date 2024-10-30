@@ -167,8 +167,10 @@ def main(input_path,export_path):
     out_folder = export_path + base + output_ts
     os.makedirs(out_folder)
     
+    # Check Inputs for Processing
     check_input(input_path,out_folder)
     
+    # Write CSV
     with open(out_folder + splitter + "Zips.csv", 'w', newline='') as csvfile:
         csv_writer = csv.writer(csvfile)
         csv_writer.writerow(('Input Path','Exported File Listing'))
