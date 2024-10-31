@@ -1,11 +1,11 @@
-import datetime
-import zipfile
-import struct
 import argparse
+import csv
+import datetime
 import os
 import sqlite3
+import struct
 import time
-import csv
+import zipfile
 
 ascii_art = r'''
                  ______    __        __    _ _             
@@ -60,6 +60,7 @@ def check_input(input_path,out_folder):
     global files_found
     
     if os.path.isdir(out_folder):
+        # Check if folder, iterate if so
         if os.path.isdir(input_path):
             for root, dirs, files in os.walk(input_path):
                 for file in files:
@@ -71,6 +72,7 @@ def check_input(input_path,out_folder):
                         count += 1
                         files_found.append((zip_file_path,str(count) + '-' + os.path.basename(zip_file_path) + '_file_listing.db'))
         
+        # Process if just a zip for input
         elif zipfile.is_zipfile(input_path):
             print(f"Processing ZIP file: {input_path}")
             process_input(input_path,out_folder)
@@ -127,6 +129,7 @@ def process_input(input_path,out_folder):
                 file_name = os.path.basename(entry_path) if is_file else None
                 file_extension = os.path.splitext(file_name)[1] if is_file else None
                 
+                # Write file listing
                 cursor.execute("INSERT OR IGNORE INTO file_listing (file_name, file_extension, entry_path, created_date, modified_date, accessed_date, is_file, size, comp_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                            (file_name, file_extension, entry_path, created_date, modified_date, accessed_date, is_file, size, comp_size))
 
