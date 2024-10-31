@@ -186,7 +186,7 @@ def main(input_path,export_path):
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ZipWalker v0.0.2 by @KevinPagano3 | @stark4n6 | https://github.com/stark4n6/ZipWalker")
-    parser.add_argument("input_path", help="Path to the ZIP file or folder containing ZIP files")
+    parser.add_argument("input_path", help="Path to the ZIP file or a folder containing ZIP files")
     parser.add_argument("export_path", help="Path for the export report")
     args = parser.parse_args()
     main(args.input_path,args.export_path)
