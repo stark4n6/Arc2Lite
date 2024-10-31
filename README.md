@@ -9,10 +9,10 @@ A simple easy script to read the contents of a zip folder and extract metadata
 ```
 usage: zipwalker.py [-h] zip_path export_path
 
-ZipWalker v0.0.1 by @KevinPagano3 | @stark4n6 | https://github.com/stark4n6/ZipWalker
+ZipWalker v0.0.2 by @KevinPagano3 | @stark4n6 | https://github.com/stark4n6/ZipWalker
 
 positional arguments:
-  zip_path     Path to the ZIP file
+  input_path     Path to the ZIP file or a folder containing ZIP files
   export_path  Path for the export report
 
 options:
