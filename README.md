@@ -10,7 +10,7 @@ Since this now handles ZIP and TAR and folder paths, the script has been renamed
 
 ## Command Line Switches
 ```
-usage: filewalker.py [-h] zip_path export_path
+usage: filewalker.py [-h] input_path export_path
 
 FileWalker v0.0.4 by @KevinPagano3 | @stark4n6 | https://github.com/stark4n6/FileWalker
 
