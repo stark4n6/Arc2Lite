@@ -6,7 +6,7 @@
 A simple easy script to read the contents of a ZIP/TAR file or folder and extract metadata
 
 ## UPDATE 2025-04-14: 
-Since this now handles ZIP and TAR and folder paths, the script has been renamed to FileWalker (how original).
+With v0.0.4 this now handles ZIP and TAR and folder paths, so the script has been renamed to FileWalker (how original).
 
 ## Command Line Switches
 ```
