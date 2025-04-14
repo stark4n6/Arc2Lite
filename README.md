@@ -3,9 +3,10 @@
 <p align="center">
 <img src="https://github.com/stark4n6/FileWalker/blob/main/filewalker_logo.png" width="300" height="300">
 </p>
-A simple easy script to read the contents of a zip folder and extract metadata
+A simple easy script to read the contents of a ZIP/TAR file or folder and extract metadata
 
-UPDATE 2025-04-14: Since this now handles ZIP and TAR and folder paths, the script has been renamed to FileWalker (how original).
+## UPDATE 2025-04-14: 
+Since this now handles ZIP and TAR and folder paths, the script has been renamed to FileWalker (how original).
 
 ## Command Line Switches
 ```
