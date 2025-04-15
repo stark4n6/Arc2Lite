@@ -3,7 +3,7 @@
 <p align="center">
 <img src="https://github.com/stark4n6/FileWalker/blob/main/arc2lite.png" width="300" height="300">
 </p>
-A simple easy script to read the contents of a ZIP/TAR file or folder and extract metadata
+A simple script to read the contents of a zip/tar/folder and extract metadata.
 
 ## UPDATE 2025-04-15:
 Because making original names is hard, this is the final form, Arc2Lite.
