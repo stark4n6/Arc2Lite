@@ -9,15 +9,14 @@ import zipfile
 import tarfile
 
 ascii_art = r'''
- ______ _ _   __          __   _ _             
-|  ____(_) |  \ \        / /  | | |            
-| |__   _| | __\ \  /\  / /_ _| | | _____ _ __ 
-|  __| | | |/ _ \ \/  \/ / _` | | |/ / _ \ '__|
-| |    | | |  __/\  /\  / (_| | |   <  __/ |   
-|_|    |_|_|\___| \/  \/ \__,_|_|_|\_\___|_|   
-                                                
-FileWalker v0.0.4
-https://github.com/stark4n6/FileWalker
+     _             ____  _     _ _       
+    / \   _ __ ___|___ \| |   (_) |_ ___ 
+   / _ \ | '__/ __| __) | |   | | __/ _ \
+  / ___ \| | | (__ / __/| |___| | ||  __/
+ /_/   \_\_|  \___|_____|_____|_|\__\___|
+                                                                           
+Arc2Lite v0.0.5
+https://github.com/stark4n6/Arc2Lite
 @KevinPagano3 | @stark4n6 | startme.stark4n6.com
 '''
 
@@ -269,7 +268,7 @@ def main(input_path, export_path):
     #print('ZIP/TAR files processed: ' + str(count))
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="FileWalker v0.0.4 by @KevinPagano3 | @stark4n6 | https://github.com/stark4n6/FileWalker")
+    parser = argparse.ArgumentParser(description="Arc2Lite v0.0.5 by @KevinPagano3 | @stark4n6 | https://github.com/stark4n6/Arc2Lite")
     parser.add_argument("input_path", help="Path to the ZIP/TAR file or folder for traversing")
     parser.add_argument("export_path", help="Path for the export report")
     #parser.add_argument("embedded extraction", help="Switch to also get file listings of ZIP/TAR files inside a folder")
