@@ -234,7 +234,7 @@ def main(input_path, export_path):
     print('Destination: ' + export_path)
     print()
 
-    base = "FileWalker_Out_"
+    base = "Arc2Lite_Out_"
 
     if is_platform_windows():
         if input_path[1] == ':': input_path = '\\\\?\\' + input_path.replace('/', '\\')
