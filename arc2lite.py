@@ -15,7 +15,7 @@ ascii_art = r'''
   / ___ \| | | (__ / __/| |___| | ||  __/
  /_/   \_\_|  \___|_____|_____|_|\__\___|
                                                                            
-Arc2Lite v0.0.5
+Arc2Lite v0.0.6
 https://github.com/stark4n6/Arc2Lite
 @KevinPagano3 | @stark4n6 | startme.stark4n6.com
 '''
@@ -268,7 +268,7 @@ def main(input_path, export_path):
     #print('ZIP/TAR files processed: ' + str(count))
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Arc2Lite v0.0.5 by @KevinPagano3 | @stark4n6 | https://github.com/stark4n6/Arc2Lite")
+    parser = argparse.ArgumentParser(description="Arc2Lite v0.0.6 by @KevinPagano3 | @stark4n6 | https://github.com/stark4n6/Arc2Lite")
     parser.add_argument("input_path", help="Path to the ZIP/TAR file or folder for traversing")
     parser.add_argument("export_path", help="Path for the export report")
     #parser.add_argument("embedded extraction", help="Switch to also get file listings of ZIP/TAR files inside a folder")

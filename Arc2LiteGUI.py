@@ -217,7 +217,7 @@ class Arc2LiteGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Arc2Lite v0.0.5")
+        self.title("Arc2Lite v0.0.6")
         self.after(250, lambda: self.iconbitmap("./assets/stark4n6.ico"))
         self.geometry("800x625")
         self.grid_columnconfigure(0, weight=1)
@@ -248,7 +248,7 @@ class Arc2LiteGUI(ctk.CTk):
         self.config(menu=menubar)
 
     def show_about(self):
-        messagebox.showinfo("About Arc2Lite", "Arc2Lite v0.0.5\nhttps://github.com/stark4n6/Arc2Lite\nCreated by @KevinPagano3 | @stark4n6")
+        messagebox.showinfo("About Arc2Lite", "Arc2Lite v0.0.6\nhttps://github.com/stark4n6/Arc2Lite\nCreated by @KevinPagano3 | @stark4n6")
 
     def close_program(self):
         self.destroy()
