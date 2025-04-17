@@ -1,7 +1,7 @@
 # Arc2Lite
 
 <p align="center">
-<img src="https://github.com/stark4n6/FileWalker/blob/main/Arc2Lite.png" width="300" height="300">
+<img src="https://github.com/stark4n6/Arc2Lite/blob/main/Arc2Lite.png" width="300" height="300">
 </p>
 A simple script to read the contents of a zip/tar/folder and extract metadata.
 
