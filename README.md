@@ -1,7 +1,7 @@
 # Arc2Lite
 
 <p align="center">
-<img src="https://github.com/stark4n6/FileWalker/blob/main/arc2lite.png" width="300" height="300">
+<img src="https://github.com/stark4n6/FileWalker/blob/main/Arc2Lite.png" width="300" height="300">
 </p>
 A simple script to read the contents of a zip/tar/folder and extract metadata.
 
@@ -13,7 +13,7 @@ With v0.0.4 this now handles ZIP and TAR and folder paths, so the script has bee
 
 ## Command Line Switches
 ```
-usage: arc2lite.py [-h] input_path export_path
+usage: Arc2Lite.py [-h] input_path export_path
 
 Arc2Lite v0.0.5 by @KevinPagano3 | @stark4n6 | https://github.com/stark4n6/Arc2Lite
 
