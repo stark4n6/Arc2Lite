@@ -275,9 +275,9 @@ class Arc2LiteGUI(ctk.CTk):
         self.input_frame.grid(row=3, column=0, padx=20, pady=(10, 5), sticky="ew")
         self.input_label = ctk.CTkLabel(self.input_frame, text="Input Path:")
         self.input_label.grid(row=0, column=0, padx=10, pady=5, sticky="w")
-        self.input_entry = ctk.CTkEntry(self.input_frame, textvariable=self.input_path)
+        self.input_entry = ctk.CTkEntry(self.input_frame, textvariable=self.input_path, state="disabled")
         self.input_entry.grid(row=0, column=1, padx=10, pady=5, sticky="ew")
-        self.input_button = ctk.CTkButton(self.input_frame, text="Browse", command=self.browse_input)
+        self.input_button = ctk.CTkButton(self.input_frame, text="Browse (TAR/GZ/ZIP)", command=self.browse_input)
         self.input_button.grid(row=0, column=2, padx=10, pady=5, sticky="e")
         self.input_frame.grid_columnconfigure(1, weight=1)
 
@@ -286,7 +286,7 @@ class Arc2LiteGUI(ctk.CTk):
         self.export_frame.grid(row=4, column=0, padx=20, pady=(5, 10), sticky="ew")
         self.export_label = ctk.CTkLabel(self.export_frame, text="Export Path:")
         self.export_label.grid(row=0, column=0, padx=10, pady=5, sticky="w")
-        self.export_entry = ctk.CTkEntry(self.export_frame, textvariable=self.export_path)
+        self.export_entry = ctk.CTkEntry(self.export_frame, textvariable=self.export_path, state="disabled")
         self.export_entry.grid(row=0, column=1, padx=10, pady=5, sticky="ew")
         self.export_button = ctk.CTkButton(self.export_frame, text="Browse", command=self.browse_export)
         self.export_button.grid(row=0, column=2, padx=10, pady=5, sticky="e")
@@ -304,7 +304,11 @@ class Arc2LiteGUI(ctk.CTk):
         self.output_text.config(state=tk.DISABLED)
 
     def browse_input(self):
-        file_or_folder = filedialog.askopenfilename()
+        file_or_folder = filedialog.askopenfilename(parent=self,
+                                                           title='Select a file',
+                                                           filetypes=(('All supported files', '*.tar *.zip *.gz'),
+                                                                      ('tar file', '*.tar'), ('zip file', '*.zip'),
+                                                                      ('gz file', '*.gz')))
         if file_or_folder:
             self.input_path.set(file_or_folder)
 
