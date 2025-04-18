@@ -21,7 +21,7 @@ With v0.0.4 this now handles ZIP and TAR and folder paths, so the script has bee
 ```
 usage: Arc2Lite.py [-h] input_path export_path
 
-Arc2Lite v0.0.5 by @KevinPagano3 | @stark4n6 | https://github.com/stark4n6/Arc2Lite
+Arc2Lite v0.0.6 by @KevinPagano3 | @stark4n6 | https://github.com/stark4n6/Arc2Lite
 
 positional arguments:
   input_path   Path to the ZIP/TAR file or folder for traversing
