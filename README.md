@@ -7,7 +7,9 @@ A simple script to read the contents of a zip/tar/gz archive and extract metadat
 
 ## UPDATE 2025-04-18:
 GUI added, mostly thanks to Gemini!
-
+<p align="center">
+<img src="https://github.com/user-attachments/assets/1df34425-1c4a-463f-8328-137f122df687">
+</p>
 ## UPDATE 2025-04-15:
 Because making original names is hard, this is the final form, Arc2Lite.
 
