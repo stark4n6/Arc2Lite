@@ -5,6 +5,9 @@
 </p>
 A simple script to read the contents of a zip/tar/gz archive and extract metadata to a SQLite DB.
 
+## UPDATE 2025-04-18:
+GUI added, mostly thanks to Gemini!
+
 ## UPDATE 2025-04-15:
 Because making original names is hard, this is the final form, Arc2Lite.
 
