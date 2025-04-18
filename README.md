@@ -27,5 +27,3 @@ positional arguments:
 options:
   -h, --help   show this help message and exit
 ```
-## To-Do
-GUI maybe?
