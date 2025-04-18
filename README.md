@@ -3,7 +3,7 @@
 <p align="center">
 <img src="https://github.com/stark4n6/Arc2Lite/blob/main/assets/Arc2Lite.png" width="300" height="300">
 </p>
-A simple script to read the contents of a zip/tar/folder and extract metadata.
+A simple script to read the contents of a zip/tar/gz archive and extract metadata to a SQLite DB.
 
 ## UPDATE 2025-04-15:
 Because making original names is hard, this is the final form, Arc2Lite.
