@@ -333,6 +333,7 @@ class Arc2LiteGUI(ctk.CTk):
 
         self.processing_thread = threading.Thread(target=self.process_data, args=(input_path, export_path))
         self.processing_thread.start()
+        self.start_time = time.time()
 
     def process_data(self, input_path, export_path):
         global files_found
@@ -391,7 +392,6 @@ class Arc2LiteGUI(ctk.CTk):
                     subprocess.Popen(['xdg-open', output_folder_path])
 
     def main_gui(self):
-        self.start_time = time.time()
         self.mainloop()
 
 if __name__ == "__main__":
