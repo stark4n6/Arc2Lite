@@ -13,9 +13,12 @@ import zipfile
 import tarfile
 import threading
 import subprocess  # For opening the file explorer
+import webbrowser
 
 IMAGE_FILENAME = "./assets/Arc2Lite.png"
 IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), IMAGE_FILENAME)
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "./assets/stark4n6.ico")
+arc_version = "v1.0.0"
 
 splitter = '\\'
 count = 0
@@ -217,8 +220,9 @@ class Arc2LiteGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Arc2Lite v0.0.6")
-        self.after(250, lambda: self.iconbitmap("./assets/stark4n6.ico"))
+        self.title(f"Arc2Lite {arc_version}")
+        self.icon_path = ICON_PATH
+        self.iconbitmap(self.icon_path)
         self.geometry("800x625")
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=0) # Image row
@@ -248,8 +252,27 @@ class Arc2LiteGUI(ctk.CTk):
         self.config(menu=menubar)
 
     def show_about(self):
-        messagebox.showinfo("About Arc2Lite", "Arc2Lite v0.0.6\nhttps://github.com/stark4n6/Arc2Lite\nCreated by @KevinPagano3 | @stark4n6")
-
+        about_window = ctk.CTkToplevel(self)
+        about_window.title("About Arc2Lite")
+        about_window.iconbitmap(self.icon_path)
+        about_window.geometry("300x170")
+        about_window.resizable(False, False)
+        about_window.transient(self) # Make the main window its parent
+        about_window.grab_set() # Modal
+        
+        # Version and Creator Info
+        ctk.CTkLabel(about_window, text=f"Arc2Lite {arc_version}").pack(pady=0)
+        ctk.CTkLabel(about_window, text="Created by @KevinPagano3 | @stark4n6").pack(pady=5)
+        
+        # Clickable URL
+        url = "https://github.com/stark4n6/Arc2Lite"
+        link_label = tk.Label(about_window, text=url, fg="blue", cursor="hand2", font=("TkDefaultFont", 10, "underline"))
+        link_label.pack(pady=5)
+        link_label.bind("<Button-1>", lambda e: webbrowser.open_new(url))
+        
+        # Close Button
+        ctk.CTkButton(about_window, text="Close", command=about_window.destroy).pack(pady=10)
+        
     def close_program(self):
         self.destroy()
 
