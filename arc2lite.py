@@ -15,7 +15,7 @@ ascii_art = r'''
   / ___ \| | | (__ / __/| |___| | ||  __/
  /_/   \_\_|  \___|_____|_____|_|\__\___|
                                                                            
-Arc2Lite v0.0.6
+Arc2Lite v1.0.0
 https://github.com/stark4n6/Arc2Lite
 @KevinPagano3 | @stark4n6 | startme.stark4n6.com
 '''
