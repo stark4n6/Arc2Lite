@@ -5,6 +5,15 @@
 </p>
 A simple script to read the contents of a zip/tar/gz archive and extract metadata to a SQLite DB.
 
+## UPDATE 2026-03-18:
+GUI and CLI have been combined into one script. If no switches are supplied it will run the GUI.
+
+Other updates include:
+- Hashing for archives
+- Recursive processing for folders of archives
+- Fallback timestamps if extended attributes aren't found
+- High level metadata about archive in each SQLite DB
+
 ## UPDATE 2025-04-18:
 GUI added, mostly thanks to Gemini!
 <p align="center">
