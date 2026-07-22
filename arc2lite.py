@@ -88,6 +88,8 @@ def setup_db(cursor):
         extraction_timestamp TEXT)''')
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_ext ON file_listing (file_extension);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mod_date ON file_listing (modified_date);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_name ON file_listing (file_name);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_path ON file_listing (entry_path);")
 
 def calculate_hash_shared(file_path, file_name, file_id, itype, algo, update_func):
     if not algo or algo == "None": return None
