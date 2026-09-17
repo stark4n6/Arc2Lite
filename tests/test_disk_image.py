@@ -12,6 +12,7 @@ run, so nothing here writes into the checkout.
 import gzip
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -28,10 +29,16 @@ FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 # Each fixture, and what it is here to prove.
 #   ntfs   real instants, all three dates, and deleted MFT records
+#   apfs   a container of several volumes, reached in one pass over its tree
 #   fat32  a zone-less wall-clock reading, and deleted directory entries
 #   exfat  the same, plus a deleted file inside a deleted directory
 #   ext4   an instant for modified and nothing for created or accessed
-RAW_FIXTURES = ("ntfs-fixture", "fat32-deleted", "exfat-deleted", "ext4-sparse")
+#
+# The .sha256 files beside them are the listings the vendored reader's own
+# self-test compares its walk against, and they are here so that check runs
+# rather than skipping when this repository's copy of the reader is tested.
+RAW_FIXTURES = ("ntfs-fixture", "apfs-fixture", "fat32-deleted", "exfat-deleted",
+                "ext4-sparse")
 E01_FIXTURE = "encase6-fast.E01"
 
 
@@ -80,6 +87,70 @@ class WalkAgreesWithTheReader(unittest.TestCase):
                         self.assertEqual(mine, theirs, f"{stem}/{vol['name']}")
                 finally:
                     fh.close()
+
+    def test_no_path_is_reported_twice(self):
+        """A path reported twice is a row that loses to INSERT OR IGNORE, and
+        the set comparison above cannot see it because a set collapses it.
+
+        The NTFS fixture holds eight extension records that carry a copy of
+        their base record's $FILE_NAME, which is exactly what produces this
+        when a reader counts them as files of their own.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            for stem in RAW_FIXTURES:
+                image = _stage(tmp, stem)
+                fh = qnxprobe.open_image(image)
+                try:
+                    for vol in qnxprobe.volumes(fh, qnxprobe.image_size(fh)):
+                        if not vol.get("walker"):
+                            continue
+                        paths = [p for p, _n, _k, _s, _m, _r
+                                 in disk_image.walk_volume(vol["walker"])]
+                        dupes = [p for p in set(paths) if paths.count(p) > 1]
+                        self.assertEqual(dupes, [], f"{stem}/{vol['name']}")
+                finally:
+                    fh.close()
+                db = _index(tmp, image)
+                dropped = db.execute(
+                    "SELECT sum(dropped_duplicate_paths) FROM image_volumes").fetchone()[0]
+                self.assertEqual(dropped, 0, stem)
+                db.close()
+
+    def test_the_vendored_reader_passes_its_own_self_test(self):
+        """The readers in vendor/ are copies, and their own tests are where
+        they are proven: they reach code this repository's fixtures cannot,
+        such as the DOS 8.3 names a Windows volume is full of and neither
+        fixture here carries. Running it is what catches a bad re-vendor.
+        """
+        import subprocess
+        vendored = os.path.abspath(os.path.join(os.path.dirname(FIXTURES), os.pardir,
+                                                "vendor", "qnxprobe.py"))
+        # Its fixture checks look for tests/fixtures beside itself, and in
+        # vendor/ there are none, so it would skip exactly the comparisons that
+        # matter. Standing it in a directory with this repository's fixtures
+        # under that name runs them, which means the vendored reader is proven
+        # against the same images the tests above use.
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copyfile(vendored, os.path.join(tmp, "qnxprobe.py"))
+            shutil.copyfile(os.path.join(os.path.dirname(vendored), "ewfprobe.py"),
+                            os.path.join(tmp, "ewfprobe.py"))
+            shutil.copytree(FIXTURES, os.path.join(tmp, "tests", "fixtures"))
+            r = subprocess.run([sys.executable, os.path.join(tmp, "qnxprobe.py"),
+                                "--self-test"],
+                               capture_output=True, text=True, timeout=900)
+        self.assertEqual(r.returncode, 0, r.stdout[-4000:])
+        self.assertIn("SELF-TEST PASSED", r.stdout)
+        # the checks that need no fixture, and the ones that need ours
+        self.assertIn("$FILE_NAME: its 8.3 twin is dropped", r.stdout)
+        self.assertIn("walk_all() reports exactly what a walk of the directory "
+                      "tree reports", r.stdout)
+        # the count, not just the sentence: a check whose verdict was removed
+        # still prints its headline
+        got = re.search(r"entries over (\d+) volume\(s\), (\d+) disagreement", r.stdout)
+        self.assertIsNotNone(got, r.stdout[-3000:])
+        self.assertGreater(int(got.group(1)), 0)
+        self.assertEqual(int(got.group(2)), 0)
+        self.assertNotIn("[FAIL]", r.stdout)
 
     def test_directories_are_reported(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -114,10 +114,6 @@ FILESYSTEMS = ("QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, exFAT, NTFS, "
 
 READER = f"qnxprobe {qnxprobe.QNXPROBE_VERSION} / ewfprobe {ewfprobe.__version__}"
 
-# A directory reached this deep in a walk is a loop in the tree, not a
-# directory. qnxprobe's own collect() uses the same ceiling.
-_MAX_DEPTH = 64
-
 _S_IFMT = 0o170000
 _S_IFDIR = 0o040000
 _S_IFREG = 0o100000
@@ -284,7 +280,7 @@ def setup_image_db(cursor):
 # -------------------------------------------------------------------- walk
 
 def walk_volume(walker):
-    """Every entry under this volume's root, directories included.
+    """Every entry in this volume, directories included.
 
     Yields ``(path, node, entry_type, size, mtime, reading)``. ``entry_type``
     is ``file``, ``dir``, ``link`` or ``special``; ``size`` is None for
@@ -292,46 +288,25 @@ def walk_volume(walker):
     stored, for the filesystems that keep a zone-less reading, and None for
     the rest.
 
-    qnxprobe's own ``collect()`` returns files only, which is what an
-    extraction needs. A listing needs the directories as well, so this walks
-    the same tree the same way and keeps them. ``test_disk_image.py`` asserts
-    the files this yields are exactly the ones ``collect()`` reports, so the
-    two cannot drift apart.
+    The walk itself is qnxprobe's ``walk_all()``, which reads an NTFS volume
+    from one pass over its $MFT and an APFS one from one pass over its catalog
+    rather than reading an index per directory. All this adds is the name for
+    what each entry turned out to be, which ``file_listing`` has no column for
+    and ``image_entries`` does. ``test_disk_image.py`` asserts the files this
+    yields are exactly the ones qnxprobe's ``collect()`` reports, and that is
+    the tree-order walk, so the fast route cannot drift away from it without
+    the test saying so.
     """
-    records = hasattr(walker, "listdir_records")
-    seen = set()
-
-    def walk(node, prefix, depth):
-        if depth > _MAX_DEPTH:
-            return
-        key = node[0] if isinstance(node, tuple) else node
-        if key in seen:
-            return
-        seen.add(key)
-        if records:
-            listing = walker.listdir_records(node)
+    for path, node, mode, size, mtime, recorded in qnxprobe.walk_all(walker):
+        fmt = mode & _S_IFMT
+        if fmt == _S_IFDIR:
+            yield (path, node, "dir", None, mtime, recorded)
+        elif fmt == _S_IFREG:
+            yield (path, node, "file", size, mtime, recorded)
+        elif fmt == _S_IFLNK:
+            yield (path, node, "link", None, mtime, recorded)
         else:
-            listing = [(name, child, None) for name, child in walker.listdir(node)]
-        for name, child, recorded in listing:
-            ent = walker.entry(child)
-            if not ent:
-                continue
-            mode, size, mtime = ent
-            path = f"{prefix}/{name}" if prefix else name
-            fmt = mode & _S_IFMT
-            if fmt == _S_IFDIR:
-                yield (path, child, "dir", None, mtime, recorded)
-                for item in walk(child, path, depth + 1):
-                    yield item
-            elif fmt == _S_IFREG:
-                yield (path, child, "file", size, mtime, recorded)
-            elif fmt == _S_IFLNK:
-                yield (path, child, "link", None, mtime, recorded)
-            else:
-                yield (path, child, "special", None, mtime, recorded)
-
-    for item in walk(walker.root, "", 0):
-        yield item
+            yield (path, node, "special", None, mtime, recorded)
 
 
 # ------------------------------------------------------------------ volumes

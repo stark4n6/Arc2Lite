@@ -19,9 +19,18 @@ python arc2lite.py -i C:\images -o C:\reports -r
 ```
 
 Nothing is extracted and no file's content is read. Only the directory trees
-are walked, and the image is never written to. A 7.4 GB Windows acquisition
-lists 156,894 entries in under nine seconds; a 32 GB macOS one lists 625,553
-across both its partitions in about two and a half minutes.
+are walked, and the image is never written to.
+
+| acquisition | entries | time |
+| --- | ---: | ---: |
+| 7.4 GB Windows E01 | 156,894 | 5.9 s |
+| 32 GB macOS E01, two partitions | 625,553 | 19.2 s |
+
+An NTFS volume is read from one sequential pass over its `$MFT` and an APFS one
+from one pass over its catalog, rather than by reading an index per directory.
+That is qnxprobe's `walk_all()`, and it is where most of the time went before:
+the same two acquisitions took 8.7 s and 155.0 s when the listing walked the
+directory tree, and the rows it produces are identical.
 
 Filesystems read: QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, exFAT, NTFS,
 HFS+, APFS, and QNX IFS boot images. Each volume is identified by its own
@@ -115,5 +124,7 @@ options:
 python -m unittest discover -s tests -v
 ```
 
-Seventeen tests covering the image path, with small filesystems built for the
-purpose in `tests/fixtures`. Run on Python 3.9, 3.10, 3.12 and 3.14.
+Nineteen tests covering the image path, with small filesystems built for the
+purpose in `tests/fixtures`. Run on Python 3.9, 3.10, 3.12 and 3.14. One of
+them stands the vendored reader beside those fixtures and runs its own
+self-test, so a bad re-vendor fails here rather than quietly later.
