@@ -153,6 +153,29 @@ def export_tables_to_csv(db_path, update=None):
         conn.close()
     return written
 
+def apply_export_choice(db_path, export, update=None):
+    """Act on --export/-e (or the GUI's matching selector) for one database:
+    'sqlite' leaves db_path exactly as process_archive_logic() (or the master
+    log) wrote it, 'csv' also writes the CSVs and then removes db_path so
+    only the CSVs remain, and 'both' writes the CSVs and keeps db_path too.
+
+    The database is always built first regardless of choice: it is what
+    gives file_listing its row-per-entry_path dedup (INSERT OR IGNORE against
+    a NOCASE PRIMARY KEY), which a straight-to-CSV write during the walk
+    would not have. 'csv' is therefore "build it, export it, then clean up
+    the working file" rather than "never build it".
+    """
+    if update is None:
+        update = lambda msg, replace_last=False: None
+    if export not in ("csv", "both"):
+        return
+    export_tables_to_csv(db_path, update)
+    if export == "csv":
+        try:
+            os.remove(db_path)
+        except OSError as e:
+            update(f"    [!] Left {os.path.basename(db_path)} in place, could not remove it: {e}\n")
+
 def calculate_hash_shared(file_path, file_name, file_id, itype, algo, update_func):
     if not algo or algo == "None": return None
     hash_func = hashlib.new(algo)
@@ -268,7 +291,7 @@ def run_cli(args):
                     h_val = calculate_hash_shared(path, file, file_id, itype, args.hash, cli_update)
                     db = process_archive_logic(path, out_root, file_id, itype, args.hash, h_val, cli_update)
                     if db:
-                        if args.csv: export_tables_to_csv(db, cli_update)
+                        apply_export_choice(db, args.export, cli_update)
                         entry = [path, itype]
                         if args.hash: entry.append(h_val)
                         entry.extend([db, datetime.datetime.now(datetime.timezone.utc).isoformat()])
@@ -281,9 +304,12 @@ def run_cli(args):
         # Closed explicitly (see process_archive_logic) since export_tables_to_csv()
         # below opens its own connection to this same master_db file right after.
         m_conn.close()
-    if args.csv: export_tables_to_csv(master_db, cli_update)
+    apply_export_choice(master_db, args.export, cli_update)
+    # csv mode removes master_db itself; point the summary at what's actually
+    # left on disk rather than a path that no longer exists.
+    master_log_display = master_db if args.export != "csv" else f"{master_db[:-3]}_csv"
     print(f"\n--- Processing Finished: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
-    print(f"**** JOB FINISHED ****\nItems Indexed: {file_id - 1}\nRuntime: {time.time()-start_epoch:.2f}s\nMaster Log: {master_db}")
+    print(f"**** JOB FINISHED ****\nItems Indexed: {file_id - 1}\nRuntime: {time.time()-start_epoch:.2f}s\nMaster Log: {master_log_display}")
 
 # --- GUI Implementation ---
 
@@ -299,7 +325,7 @@ if GUI_SUPPORT:
             self.input_path = tk.StringVar(); self.export_path = tk.StringVar(); self.is_folder = False
             self.hash_choice = tk.StringVar(value="None")
             self.hash_vars = {k: tk.BooleanVar(value=False) for k in ["md5", "sha1", "sha256"]}
-            self.csv_var = tk.BooleanVar(value=False)
+            self.export_choice = tk.StringVar(value="SQLite")
             self.create_menu(); self.create_widgets()
 
         def center_window(self, win, width, height):
@@ -333,7 +359,8 @@ if GUI_SUPPORT:
             hc = ctk.CTkFrame(f3, fg_color="transparent"); hc.pack(expand=True)
             for i, (k, v) in enumerate(self.hash_vars.items()):
                 ctk.CTkCheckBox(hc, text=k.upper(), variable=v, command=lambda x=k: self.h_c(x)).grid(row=0, column=i, padx=30, pady=10)
-            ctk.CTkCheckBox(f3, text="Also export to CSV", variable=self.csv_var).pack(pady=(0, 10))
+            ctk.CTkLabel(f3, text="Export Format", font=ctk.CTkFont(size=13, weight="bold")).pack(pady=(5, 0))
+            ctk.CTkSegmentedButton(f3, values=["SQLite", "CSV", "Both"], variable=self.export_choice).pack(pady=(5, 10))
 
             self.btn = ctk.CTkButton(self, text="Start Forensic Indexing", font=ctk.CTkFont(size=14, weight="bold"), command=self.start)
             self.btn.grid(row=3, column=0, padx=20, pady=15, sticky="ew")
@@ -362,7 +389,7 @@ if GUI_SUPPORT:
             start_epoch = time.time()
             out_root = os.path.join(self.export_path.get(), f"Arc2Lite_Out_{time.strftime('%Y%m%d-%H%M%S')}")
             os.makedirs(out_root, exist_ok=True)
-            algo = self.hash_choice.get(); do_csv = self.csv_var.get(); master_db = os.path.join(out_root, "Arc2Lite_Master_Log.db")
+            algo = self.hash_choice.get(); export = self.export_choice.get().lower(); master_db = os.path.join(out_root, "Arc2Lite_Master_Log.db")
             h_col = f"{algo}_hash TEXT," if algo != "None" else ""
             m_conn = sqlite3.connect(master_db)
             try:
@@ -377,7 +404,7 @@ if GUI_SUPPORT:
                             self.log(f"[{file_id}] [{itype}] {file}\n")
                             h_val = calculate_hash_shared(p, file, file_id, itype, algo, self.log)
                             db = process_archive_logic(p, out_root, file_id, itype, algo, h_val, self.log)
-                            if db and do_csv: export_tables_to_csv(db, self.log)
+                            if db: apply_export_choice(db, export, self.log)
                             entry = [p, itype]
                             if algo != "None": entry.append(h_val)
                             entry.extend([db, datetime.datetime.now(datetime.timezone.utc).isoformat()])
@@ -389,7 +416,7 @@ if GUI_SUPPORT:
                 # Closed explicitly (see process_archive_logic) since export_tables_to_csv()
                 # below opens its own connection to this same master_db file right after.
                 m_conn.close()
-            if do_csv: export_tables_to_csv(master_db, self.log)
+            apply_export_choice(master_db, export, self.log)
             self.log(f"--- Processing Finished: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
             self.after(0, lambda: self.finish_dialog(out_root, file_id-1, start_epoch))
 
@@ -435,7 +462,8 @@ if __name__ == "__main__":
                             help="ZIP/TAR/GZ archive, raw disk image, .E01 acquisition, or a folder of them")
         parser.add_argument("-o", "--output", required=True, help="Path for the export report")
         parser.add_argument("-r", "--recursive", action="store_true", help="Recursively scan folder for archives"); parser.add_argument("-ha", "--hash", choices=['md5', 'sha1', 'sha256'], help="Optional hashing options")
-        parser.add_argument("-c", "--csv", action="store_true", help="Also export each database table to CSV, alongside the SQLite database")
+        parser.add_argument("-e", "--export", choices=["sqlite", "csv", "both"], default="sqlite",
+                            help="Export format for the results: 'sqlite' (default), 'csv', or 'both'")
         run_cli(parser.parse_args())
     else:
         if GUI_SUPPORT: app = Arc2LiteGUI(); app.mainloop()
