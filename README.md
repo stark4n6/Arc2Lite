@@ -120,8 +120,9 @@ With v0.0.4 this now handles ZIP and TAR and folder paths, so the script has bee
 usage: arc2lite.py [-h] -i INPUT -o OUTPUT [-r] [-ha {md5,sha1,sha256}]
 
 options:
-  -c, --csv             Also export each database table and metadata report from disk images to CSV, alongside
-                        the SQLite database
+   -e, --export {sqlite,csv,both}
+                        Export format for the results: 'sqlite' (default),
+                        'csv', or 'both'
   -h, --help            show this help message and exit
   -i, --input INPUT     ZIP/TAR/GZ archive, raw disk image, .E01 acquisition,
                         or a folder of them
