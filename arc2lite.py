@@ -1,4 +1,5 @@
 import argparse
+import csv
 import datetime
 import os
 import sqlite3
@@ -109,6 +110,49 @@ def setup_db(cursor):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_name ON file_listing (file_name);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_entry_path ON file_listing (entry_path);")
 
+def export_tables_to_csv(db_path, update=None):
+    """Export every table in the SQLite database at db_path to its own CSV
+    file, written into a '<db file name>_csv' folder beside it. Returns the
+    list of CSV paths written.
+
+    This reads back whatever process_archive_logic (or the master log) just
+    committed, so it works the same for an archive's file_listing/
+    archive_metadata, an image's extra image_* tables, and the master log's
+    processing_log, without needing to know which tables exist.
+    """
+    if update is None:
+        update = lambda msg, replace_last=False: None
+    stem = db_path[:-3] if db_path.lower().endswith(".db") else db_path
+    csv_dir = f"{stem}_csv"
+    os.makedirs(csv_dir, exist_ok=True)
+    written = []
+    # A plain "with sqlite3.connect(...) as conn" only commits/rolls back on
+    # exit, it does not close the connection. Windows keeps the database file
+    # locked for as long as that handle is open, which then fails a caller
+    # trying to move or delete it (a temp-dir cleanup, a re-run into the same
+    # output folder), so this closes explicitly rather than waiting on
+    # garbage collection to get around to it.
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        for table in tables:
+            csv_path = os.path.join(csv_dir, f"{table}.csv")
+            try:
+                cursor = conn.execute(f'SELECT * FROM "{table}"')
+                headers = [d[0] for d in cursor.description]
+                with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                    writer.writerows(cursor)
+                written.append(csv_path)
+            except Exception as e:
+                update(f"    [!] Failed to write CSV for {table}: {e}\n")
+    finally:
+        conn.close()
+    return written
+
 def calculate_hash_shared(file_path, file_name, file_id, itype, algo, update_func):
     if not algo or algo == "None": return None
     hash_func = hashlib.new(algo)
@@ -138,47 +182,56 @@ def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_va
     db_path = os.path.join(out_folder, f"{uid}-{os.path.basename(file_path)}_file_listing.db")
     if update is None:
         update = lambda msg, replace_last=False: None
+    # sqlite3.connect() used as "with conn:" only commits/rolls back on exit,
+    # it does not close the connection. Windows keeps the .db file locked for
+    # as long as that handle is open, which then fails a caller trying to
+    # move or delete it, so this closes explicitly in a finally rather than
+    # waiting on garbage collection to get around to it.
+    conn = None
     try:
-        with sqlite3.connect(db_path) as conn:
-            cursor = conn.cursor()
-            setup_db(cursor)
-            cursor.execute('INSERT INTO archive_metadata VALUES (?,?,?,?,?,?,?)',
-                (os.path.basename(file_path), file_path, f_type, os.path.getsize(file_path), 
-                 hash_algo or "None", hash_val or "N/A", datetime.datetime.now(datetime.timezone.utc).isoformat()))
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        setup_db(cursor)
+        cursor.execute('INSERT INTO archive_metadata VALUES (?,?,?,?,?,?,?)',
+            (os.path.basename(file_path), file_path, f_type, os.path.getsize(file_path),
+             hash_algo or "None", hash_val or "N/A", datetime.datetime.now(datetime.timezone.utc).isoformat()))
 
-            if f_type in ("RAW", "E01"):
-                # A disk image holds its file listing behind a filesystem
-                # instead of behind a central directory. Same rows, same
-                # table, plus the image_* tables for what a volume has and an
-                # archive does not.
-                disk_image.index_image(file_path, cursor, f_type, update)
-            elif f_type == "ZIP":
-                with zipfile.ZipFile(file_path, 'r', allowZip64=True) as arc:
-                    for info in arc.infolist():
-                        m = datetime.datetime(*info.date_time, tzinfo=datetime.timezone.utc).timestamp()
-                        c = a = m 
-                        ext = decode_extended_ts(info.extra)
-                        if ext:
-                            m = ext.get('m', m); a = ext.get('a', m); c = ext.get('c', m)
-                        is_f = 1 if not info.filename.endswith('/') else 0
+        if f_type in ("RAW", "E01"):
+            # A disk image holds its file listing behind a filesystem
+            # instead of behind a central directory. Same rows, same
+            # table, plus the image_* tables for what a volume has and an
+            # archive does not.
+            disk_image.index_image(file_path, cursor, f_type, update)
+        elif f_type == "ZIP":
+            with zipfile.ZipFile(file_path, 'r', allowZip64=True) as arc:
+                for info in arc.infolist():
+                    m = datetime.datetime(*info.date_time, tzinfo=datetime.timezone.utc).timestamp()
+                    c = a = m
+                    ext = decode_extended_ts(info.extra)
+                    if ext:
+                        m = ext.get('m', m); a = ext.get('a', m); c = ext.get('c', m)
+                    is_f = 1 if not info.filename.endswith('/') else 0
+                    cursor.execute("INSERT OR IGNORE INTO file_listing VALUES (?,?,?,?,?,?,?,?,?)",
+                                   (os.path.basename(info.filename), os.path.splitext(info.filename)[1], info.filename,
+                                    format_ts(c), format_ts(m), format_ts(a), is_f, info.file_size, info.compress_size))
+        elif f_type in ["TAR", "GZ"]:
+            mode = "r:gz" if f_type == "GZ" else "r:*"
+            with tarfile.open(file_path, mode, errorlevel=0) as arc:
+                for mem in arc:
+                    if mem.isfile() or mem.isdir():
+                        m = mem.mtime
+                        is_f = 1 if mem.isfile() else 0
                         cursor.execute("INSERT OR IGNORE INTO file_listing VALUES (?,?,?,?,?,?,?,?,?)",
-                                       (os.path.basename(info.filename), os.path.splitext(info.filename)[1], info.filename, 
-                                        format_ts(c), format_ts(m), format_ts(a), is_f, info.file_size, info.compress_size))
-            elif f_type in ["TAR", "GZ"]:
-                mode = "r:gz" if f_type == "GZ" else "r:*"
-                with tarfile.open(file_path, mode, errorlevel=0) as arc:
-                    for mem in arc:
-                        if mem.isfile() or mem.isdir():
-                            m = mem.mtime
-                            is_f = 1 if mem.isfile() else 0
-                            cursor.execute("INSERT OR IGNORE INTO file_listing VALUES (?,?,?,?,?,?,?,?,?)",
-                                           (os.path.basename(mem.name), os.path.splitext(mem.name)[1], mem.name, 
-                                            format_ts(m), format_ts(m), format_ts(m), is_f, mem.size, None))
-            conn.commit()
+                                       (os.path.basename(mem.name), os.path.splitext(mem.name)[1], mem.name,
+                                        format_ts(m), format_ts(m), format_ts(m), is_f, mem.size, None))
+        conn.commit()
         return db_path
     except Exception as e:
         update(f"    [!] Failed to index {os.path.basename(file_path)}: {e}\n")
         return None
+    finally:
+        if conn is not None:
+            conn.close()
 
 # --- CLI Implementation ---
 
@@ -195,7 +248,8 @@ def run_cli(args):
         if replace_last: sys.stdout.write(f"\r{msg.strip()}"); sys.stdout.flush()
         else: sys.stdout.write(f"\n{msg}" if not msg.startswith('[') else msg); sys.stdout.flush()
 
-    with sqlite3.connect(master_db) as m_conn:
+    m_conn = sqlite3.connect(master_db)
+    try:
         m_cursor = m_conn.cursor()
         m_cursor.execute(f"CREATE TABLE processing_log (input_path TEXT, item_type TEXT, {h_col} database_output TEXT, timestamp TEXT)")
         file_id = 1
@@ -214,6 +268,7 @@ def run_cli(args):
                     h_val = calculate_hash_shared(path, file, file_id, itype, args.hash, cli_update)
                     db = process_archive_logic(path, out_root, file_id, itype, args.hash, h_val, cli_update)
                     if db:
+                        if args.csv: export_tables_to_csv(db, cli_update)
                         entry = [path, itype]
                         if args.hash: entry.append(h_val)
                         entry.extend([db, datetime.datetime.now(datetime.timezone.utc).isoformat()])
@@ -222,6 +277,11 @@ def run_cli(args):
                         file_id += 1
             if not args.recursive: break
         m_conn.commit()
+    finally:
+        # Closed explicitly (see process_archive_logic) since export_tables_to_csv()
+        # below opens its own connection to this same master_db file right after.
+        m_conn.close()
+    if args.csv: export_tables_to_csv(master_db, cli_update)
     print(f"\n--- Processing Finished: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
     print(f"**** JOB FINISHED ****\nItems Indexed: {file_id - 1}\nRuntime: {time.time()-start_epoch:.2f}s\nMaster Log: {master_db}")
 
@@ -239,6 +299,7 @@ if GUI_SUPPORT:
             self.input_path = tk.StringVar(); self.export_path = tk.StringVar(); self.is_folder = False
             self.hash_choice = tk.StringVar(value="None")
             self.hash_vars = {k: tk.BooleanVar(value=False) for k in ["md5", "sha1", "sha256"]}
+            self.csv_var = tk.BooleanVar(value=False)
             self.create_menu(); self.create_widgets()
 
         def center_window(self, win, width, height):
@@ -272,7 +333,8 @@ if GUI_SUPPORT:
             hc = ctk.CTkFrame(f3, fg_color="transparent"); hc.pack(expand=True)
             for i, (k, v) in enumerate(self.hash_vars.items()):
                 ctk.CTkCheckBox(hc, text=k.upper(), variable=v, command=lambda x=k: self.h_c(x)).grid(row=0, column=i, padx=30, pady=10)
-            
+            ctk.CTkCheckBox(f3, text="Also export to CSV", variable=self.csv_var).pack(pady=(0, 10))
+
             self.btn = ctk.CTkButton(self, text="Start Forensic Indexing", font=ctk.CTkFont(size=14, weight="bold"), command=self.start)
             self.btn.grid(row=3, column=0, padx=20, pady=15, sticky="ew")
             
@@ -300,9 +362,10 @@ if GUI_SUPPORT:
             start_epoch = time.time()
             out_root = os.path.join(self.export_path.get(), f"Arc2Lite_Out_{time.strftime('%Y%m%d-%H%M%S')}")
             os.makedirs(out_root, exist_ok=True)
-            algo = self.hash_choice.get(); master_db = os.path.join(out_root, "Arc2Lite_Master_Log.db")
+            algo = self.hash_choice.get(); do_csv = self.csv_var.get(); master_db = os.path.join(out_root, "Arc2Lite_Master_Log.db")
             h_col = f"{algo}_hash TEXT," if algo != "None" else ""
-            with sqlite3.connect(master_db) as m_conn:
+            m_conn = sqlite3.connect(master_db)
+            try:
                 m_cursor = m_conn.cursor()
                 m_cursor.execute(f"CREATE TABLE processing_log (input_path TEXT, item_type TEXT, {h_col} database_output TEXT, timestamp TEXT)")
                 file_id = 1
@@ -314,6 +377,7 @@ if GUI_SUPPORT:
                             self.log(f"[{file_id}] [{itype}] {file}\n")
                             h_val = calculate_hash_shared(p, file, file_id, itype, algo, self.log)
                             db = process_archive_logic(p, out_root, file_id, itype, algo, h_val, self.log)
+                            if db and do_csv: export_tables_to_csv(db, self.log)
                             entry = [p, itype]
                             if algo != "None": entry.append(h_val)
                             entry.extend([db, datetime.datetime.now(datetime.timezone.utc).isoformat()])
@@ -321,6 +385,11 @@ if GUI_SUPPORT:
                             self.log(f"    --- Item Processed ---\n\n")
                             file_id += 1
                 m_conn.commit()
+            finally:
+                # Closed explicitly (see process_archive_logic) since export_tables_to_csv()
+                # below opens its own connection to this same master_db file right after.
+                m_conn.close()
+            if do_csv: export_tables_to_csv(master_db, self.log)
             self.log(f"--- Processing Finished: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
             self.after(0, lambda: self.finish_dialog(out_root, file_id-1, start_epoch))
 
@@ -366,6 +435,7 @@ if __name__ == "__main__":
                             help="ZIP/TAR/GZ archive, raw disk image, .E01 acquisition, or a folder of them")
         parser.add_argument("-o", "--output", required=True, help="Path for the export report")
         parser.add_argument("-r", "--recursive", action="store_true", help="Recursively scan folder for archives"); parser.add_argument("-ha", "--hash", choices=['md5', 'sha1', 'sha256'], help="Optional hashing options")
+        parser.add_argument("-c", "--csv", action="store_true", help="Also export each database table to CSV, alongside the SQLite database")
         run_cli(parser.parse_args())
     else:
         if GUI_SUPPORT: app = Arc2LiteGUI(); app.mainloop()
