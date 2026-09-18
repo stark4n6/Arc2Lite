@@ -10,17 +10,29 @@ import sys
 import hashlib
 import threading
 import subprocess
-import tkinter as tk
-from tkinter import filedialog, scrolledtext, Menu
 import webbrowser
 
-# Attempt to load GUI-specific libraries
+# Attempt to load GUI-specific libraries. tkinter is in the standard library
+# but Tk itself is not always built with Python: a headless Linux server and
+# some Homebrew builds have no _tkinter, and importing it at the top of the
+# file stopped the command line running there at all.
 try:
+    import tkinter as tk
+    from tkinter import filedialog, scrolledtext, Menu
     import customtkinter as ctk
     from PIL import Image, ImageTk
     GUI_SUPPORT = True
 except ImportError:
     GUI_SUPPORT = False
+
+# Disk image and EnCase/EWF input. The readers behind it are vendored in
+# vendor/ and are standard library only, so this needs nothing installed; it is
+# still optional, and without it Arc2Lite reads archives exactly as before.
+try:
+    import disk_image
+    IMAGE_SUPPORT = True
+except ImportError:
+    IMAGE_SUPPORT = False
 
 # --- Global Configurations ---
 arc_version = "v2.0.0"
@@ -51,6 +63,12 @@ def get_forensic_type(file_path):
             if header.startswith(b'\x1f\x8b') and ext.endswith('.gz'): return "GZ"
             if header[257:262] == b'ustar' and ext.endswith('.tar'): return "TAR"
     except: return None
+    # A raw disk image or an EnCase/EWF acquisition. Decided by reading the
+    # image rather than by its name: a file with an image extension that holds
+    # no volume this reader recognises is not claimed. A later segment of a
+    # split set returns None, so a set is indexed once, from its first segment.
+    if IMAGE_SUPPORT:
+        return disk_image.detect(file_path)
     return None
 
 def decode_extended_ts(extra_data):
@@ -116,8 +134,10 @@ def calculate_hash_shared(file_path, file_name, file_id, itype, algo, update_fun
         update_func(f"    [!] Hash Error on {file_name}: {e}\n")
         return "HASH_ERROR"
 
-def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_val):
+def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_val, update=None):
     db_path = os.path.join(out_folder, f"{uid}-{os.path.basename(file_path)}_file_listing.db")
+    if update is None:
+        update = lambda msg, replace_last=False: None
     try:
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
@@ -126,7 +146,13 @@ def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_va
                 (os.path.basename(file_path), file_path, f_type, os.path.getsize(file_path), 
                  hash_algo or "None", hash_val or "N/A", datetime.datetime.now(datetime.timezone.utc).isoformat()))
 
-            if f_type == "ZIP":
+            if f_type in ("RAW", "E01"):
+                # A disk image holds its file listing behind a filesystem
+                # instead of behind a central directory. Same rows, same
+                # table, plus the image_* tables for what a volume has and an
+                # archive does not.
+                disk_image.index_image(file_path, cursor, f_type, update)
+            elif f_type == "ZIP":
                 with zipfile.ZipFile(file_path, 'r', allowZip64=True) as arc:
                     for info in arc.infolist():
                         m = datetime.datetime(*info.date_time, tzinfo=datetime.timezone.utc).timestamp()
@@ -150,7 +176,9 @@ def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_va
                                             format_ts(m), format_ts(m), format_ts(m), is_f, mem.size, None))
             conn.commit()
         return db_path
-    except: return None
+    except Exception as e:
+        update(f"    [!] Failed to index {os.path.basename(file_path)}: {e}\n")
+        return None
 
 # --- CLI Implementation ---
 
@@ -171,19 +199,26 @@ def run_cli(args):
         m_cursor = m_conn.cursor()
         m_cursor.execute(f"CREATE TABLE processing_log (input_path TEXT, item_type TEXT, {h_col} database_output TEXT, timestamp TEXT)")
         file_id = 1
-        for root, _, files in os.walk(args.input):
+        # A folder is swept; a single file is indexed on its own, which is how
+        # one archive or one disk image is handed in.
+        if os.path.isfile(args.input):
+            targets = [(os.path.dirname(os.path.abspath(args.input)), [],
+                        [os.path.basename(args.input)])]
+        else:
+            targets = os.walk(args.input)
+        for root, _, files in targets:
             for file in files:
                 path = os.path.join(root, file); itype = get_forensic_type(path)
                 if itype:
                     cli_update(f"[{file_id}] [{itype}] {file}\n")
                     h_val = calculate_hash_shared(path, file, file_id, itype, args.hash, cli_update)
-                    db = process_archive_logic(path, out_root, file_id, itype, args.hash, h_val)
+                    db = process_archive_logic(path, out_root, file_id, itype, args.hash, h_val, cli_update)
                     if db:
                         entry = [path, itype]
                         if args.hash: entry.append(h_val)
                         entry.extend([db, datetime.datetime.now(datetime.timezone.utc).isoformat()])
                         m_cursor.execute(f"INSERT INTO processing_log VALUES ({','.join(['?']*len(entry))})", entry)
-                        cli_update(f"--- Archive Processed ---\n\n")
+                        cli_update(f"--- Item Processed ---\n\n")
                         file_id += 1
             if not args.recursive: break
         m_conn.commit()
@@ -273,12 +308,12 @@ if GUI_SUPPORT:
                         if itype:
                             self.log(f"[{file_id}] [{itype}] {file}\n")
                             h_val = calculate_hash_shared(p, file, file_id, itype, algo, self.log)
-                            db = process_archive_logic(p, out_root, file_id, itype, algo, h_val)
+                            db = process_archive_logic(p, out_root, file_id, itype, algo, h_val, self.log)
                             entry = [p, itype]
                             if algo != "None": entry.append(h_val)
                             entry.extend([db, datetime.datetime.now(datetime.timezone.utc).isoformat()])
                             m_cursor.execute(f"INSERT INTO processing_log VALUES ({','.join(['?']*len(entry))})", entry)
-                            self.log(f"    --- Archive Processed ---\n\n")
+                            self.log(f"    --- Item Processed ---\n\n")
                             file_id += 1
                 m_conn.commit()
             self.log(f"--- Processing Finished: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
@@ -322,7 +357,9 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         print(ascii_art)
         parser = argparse.ArgumentParser()
-        parser.add_argument("-i", "--input", required=True); parser.add_argument("-o", "--output", required=True)
+        parser.add_argument("-i", "--input", required=True,
+                            help="ZIP/TAR/GZ archive, raw disk image, .E01 acquisition, or a folder of them")
+        parser.add_argument("-o", "--output", required=True, help="Path for the export report")
         parser.add_argument("-r", "--recursive", action="store_true", help="Recursively scan folder for archives"); parser.add_argument("-ha", "--hash", choices=['md5', 'sha1', 'sha256'], help="Optional hashing options")
         run_cli(parser.parse_args())
     else:

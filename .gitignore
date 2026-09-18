@@ -2,3 +2,5 @@ auto-py-to-exe-config.json
 Arc2Lite.spec
 build/*
 dist/*
+__pycache__/
+*.pyc
