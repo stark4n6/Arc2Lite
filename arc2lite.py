@@ -35,7 +35,7 @@ except ImportError:
     IMAGE_SUPPORT = False
 
 # --- Global Configurations ---
-arc_version = "v2.0.0"
+arc_version = "v3.0.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "assets", "Arc2Lite.png")
 ICON_PATH = os.path.join(BASE_DIR, "assets", "stark4n6.ico")
@@ -255,24 +255,29 @@ if GUI_SUPPORT:
                     self.img_tk = ImageTk.PhotoImage(img)
                     ctk.CTkLabel(self, image=self.img_tk, text="").grid(row=0, column=0, pady=5)
             except: pass
-            f1 = ctk.CTkFrame(self); f1.grid(row=1, column=0, padx=20, pady=5, sticky="ew")
-            ctk.CTkEntry(f1, textvariable=self.input_path).grid(row=0, column=0, padx=(10, 5), pady=10, sticky="ew")
-            ctk.CTkButton(f1, text="Folder", width=120, command=self.b_f).grid(row=0, column=1, padx=2)
-            ctk.CTkButton(f1, text="Archive", width=120, command=self.b_a).grid(row=0, column=2, padx=(2, 10))
-            f1.grid_columnconfigure(0, weight=1)
-            f2 = ctk.CTkFrame(self); f2.grid(row=2, column=0, padx=20, pady=5, sticky="ew")
-            ctk.CTkEntry(f2, textvariable=self.export_path).grid(row=0, column=0, padx=(10, 5), pady=10, sticky="ew")
-            ctk.CTkButton(f2, text="Export", width=120, command=self.b_e).grid(row=0, column=1, padx=(2, 134))
-            f2.grid_columnconfigure(0, weight=1)
-            f3 = ctk.CTkFrame(self); f3.grid(row=3, column=0, padx=20, pady=5, sticky="ew")
+            
+            f_paths = ctk.CTkFrame(self)
+            f_paths.grid(row=1, column=0, padx=20, pady=5, sticky="ew")
+            f_paths.grid_columnconfigure(0, weight=1)
+
+            ctk.CTkEntry(f_paths, textvariable=self.input_path).grid(row=0, column=0, padx=(10, 5), pady=(10, 5), sticky="ew")
+            ctk.CTkButton(f_paths, text="Folder", width=120, command=self.b_f).grid(row=0, column=1, padx=2, pady=(10, 5))
+            ctk.CTkButton(f_paths, text="Archive/Evidence File", command=self.b_a).grid(row=0, column=2, padx=(2, 10), pady=(10, 5))
+
+            ctk.CTkEntry(f_paths, textvariable=self.export_path).grid(row=1, column=0, padx=(10, 5), pady=(5, 10), sticky="ew")
+            ctk.CTkButton(f_paths, text="Export", width=120, command=self.b_e).grid(row=1, column=1, padx=2, pady=(5, 10))
+
+            f3 = ctk.CTkFrame(self); f3.grid(row=2, column=0, padx=20, pady=5, sticky="ew")
             ctk.CTkLabel(f3, text="Calculate Hash (Optional)", font=ctk.CTkFont(size=13, weight="bold")).pack(pady=(10, 0))
             hc = ctk.CTkFrame(f3, fg_color="transparent"); hc.pack(expand=True)
             for i, (k, v) in enumerate(self.hash_vars.items()):
                 ctk.CTkCheckBox(hc, text=k.upper(), variable=v, command=lambda x=k: self.h_c(x)).grid(row=0, column=i, padx=30, pady=10)
+            
             self.btn = ctk.CTkButton(self, text="Start Forensic Indexing", font=ctk.CTkFont(size=14, weight="bold"), command=self.start)
-            self.btn.grid(row=4, column=0, padx=20, pady=15, sticky="ew")
-            self.out = scrolledtext.ScrolledText(self, height=18); self.out.grid(row=5, column=0, padx=20, pady=10, sticky="nsew")
-            self.grid_rowconfigure(5, weight=1)
+            self.btn.grid(row=3, column=0, padx=20, pady=15, sticky="ew")
+            
+            self.out = scrolledtext.ScrolledText(self, height=18); self.out.grid(row=4, column=0, padx=20, pady=10, sticky="nsew")
+            self.grid_rowconfigure(4, weight=1)
 
         def b_f(self): p = filedialog.askdirectory(); self.input_path.set(p); self.is_folder = True
         def b_a(self): p = filedialog.askopenfilename(); self.input_path.set(p); self.is_folder = False
@@ -364,4 +369,4 @@ if __name__ == "__main__":
         run_cli(parser.parse_args())
     else:
         if GUI_SUPPORT: app = Arc2LiteGUI(); app.mainloop()
-        else: print("GUI libraries not found. Use CLI switches.")
+        else: print("GUI libraries not found. Use CLI switches or check requirements.txt for the third-party libraries needed.")
