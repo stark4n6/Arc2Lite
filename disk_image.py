@@ -96,6 +96,12 @@ RAW_IMAGE_SUFFIXES = (".img", ".dd", ".raw")
 AMBIGUOUS_SUFFIXES = (".bin",)
 
 
+def normalize_separators(path_str):
+    if not path_str:
+        return path_str
+    target_sep = '\\' if os.name == 'nt' else '/'
+    return path_str.replace('/', target_sep).replace('\\', target_sep)
+
 def _maybe_an_image_name(lowered):
     """True when this name is one a disk image is sometimes given.
 
@@ -326,6 +332,8 @@ def _index_volume(cursor, vol, update):
 
     for path, node, kind, size, mtime, recorded in walk_volume(walker):
         entry_path = f"{volume}/{path}"
+        normalized_entry = normalize_separators(entry_path)
+        
         if kind == "dir":
             dir_paths[node[0] if isinstance(node, tuple) else node] = path
 
@@ -343,12 +351,12 @@ def _index_volume(cursor, vol, update):
         # is_file carries the archive path's meaning: 1 for anything that is
         # not a directory. image_entries.entry_type says what it really is.
         cursor.execute("INSERT OR IGNORE INTO file_listing VALUES (?,?,?,?,?,?,?,?,?)",
-                       (os.path.basename(path), os.path.splitext(path)[1], entry_path,
+                       (os.path.basename(path), os.path.splitext(path)[1], normalized_entry,
                         created, modified, accessed,
                         0 if kind == "dir" else 1, size, None))
         if cursor.rowcount:
             cursor.execute("INSERT OR IGNORE INTO image_entries VALUES (?,?,?,?,?,?,?,?)",
-                           (entry_path, volume, kind, basis, json.dumps(node),
+                           (normalized_entry, volume, kind, basis, json.dumps(node),
                             created, modified, accessed))
             counts["file" if kind == "file" else "dir" if kind == "dir" else "other"] += 1
         else:
@@ -384,16 +392,18 @@ def _index_deleted(cursor, vol, dir_paths, update):
         # join. Empty when the parent was itself deleted and so never walked.
         where = dir_paths.get(e.parent)
         parent = "" if where is None else (f"{volume}/{where}" if where else volume)
+        normalized_parent = normalize_separators(parent)
+        
         ext = os.path.splitext(e.name)[1]
         if ntfs:
-            rows.append((volume, e.name, ext, parent, str(e.parent),
+            rows.append((volume, e.name, ext, normalized_parent, str(e.parent),
                          "dir" if e.is_dir else "file", e.size,
                          1 if e.recoverable else 0, e.reason or "", 0, 0,
                          f"MFT record {e.record}", UTC,
                          format_instant(e.created), format_instant(e.modified),
                          format_instant(e.accessed)))
         else:
-            rows.append((volume, e.name, ext, parent, str(e.parent),
+            rows.append((volume, e.name, ext, normalized_parent, str(e.parent),
                          "dir" if e.is_dir else "file", e.size,
                          1 if e.recoverable else 0, e.reason or "",
                          1 if e.assumed_contiguous else 0,
@@ -460,11 +470,13 @@ def index_image(file_path, cursor, image_type, update):
     setup_image_db(cursor)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     name = os.path.basename(file_path)
+    
+    normalized_file_path = normalize_separators(file_path)
 
     try:
         segments = qnxprobe.split_segments(file_path) if image_type == "RAW" else None
     except qnxprobe.SplitImageError as exc:
-        write_image_metadata(cursor, source_file_name=name, source_full_path=file_path,
+        write_image_metadata(cursor, source_file_name=name, source_full_path=normalized_file_path,
                              image_type=image_type, segments="[]", reader=READER,
                              volumes_found=0, volumes_walked=0,
                              extraction_timestamp=now, note=str(exc))
@@ -474,7 +486,7 @@ def index_image(file_path, cursor, image_type, update):
     try:
         fh = qnxprobe.open_image(file_path, segments or None)
     except Exception as exc:                         # pylint: disable=broad-except
-        write_image_metadata(cursor, source_file_name=name, source_full_path=file_path,
+        write_image_metadata(cursor, source_file_name=name, source_full_path=normalized_file_path,
                              image_type=image_type, segments="[]", reader=READER,
                              volumes_found=0, volumes_walked=0,
                              extraction_timestamp=now, note=f"could not open: {exc}")
@@ -513,7 +525,7 @@ def index_image(file_path, cursor, image_type, update):
                             vol.get("missing_past_end", 0), 1 if walker is not None else 0,
                             basis, counts["file"], counts["dir"], counts["other"],
                             deleted, counts["dropped"], note))
-        write_image_metadata(cursor, source_file_name=name, source_full_path=file_path,
+        write_image_metadata(cursor, source_file_name=name, source_full_path=normalized_file_path,
                              image_type=image_type, media_size_bytes=media_size,
                              reader=READER, volumes_found=totals["volumes"],
                              volumes_walked=totals["walked"], extraction_timestamp=now,
