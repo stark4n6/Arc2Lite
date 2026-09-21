@@ -36,7 +36,7 @@ except ImportError:
     IMAGE_SUPPORT = False
 
 # --- Global Configurations ---
-arc_version = "v3.0.0"
+arc_version = "v3.1.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "assets", "Arc2Lite.png")
 ICON_PATH = os.path.join(BASE_DIR, "assets", "stark4n6.ico")
@@ -53,6 +53,12 @@ https://github.com/stark4n6/Arc2Lite
 '''
 
 # --- Shared Forensic Logic ---
+
+def normalize_separators(path_str):
+    if not path_str:
+        return path_str
+    target_sep = '\\' if os.name == 'nt' else '/'
+    return path_str.replace('/', target_sep).replace('\\', target_sep)
 
 def get_forensic_type(file_path):
     if not os.path.isfile(file_path) or os.path.getsize(file_path) < 512: return None
@@ -215,8 +221,12 @@ def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_va
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         setup_db(cursor)
+        
+        # Apply the path normalization to the full file_path before inserting it into the archive_metadata table
+        normalized_source_path = normalize_separators(file_path)
+        
         cursor.execute('INSERT INTO archive_metadata VALUES (?,?,?,?,?,?,?)',
-            (os.path.basename(file_path), file_path, f_type, os.path.getsize(file_path),
+            (os.path.basename(file_path), normalized_source_path, f_type, os.path.getsize(file_path),
              hash_algo or "None", hash_val or "N/A", datetime.datetime.now(datetime.timezone.utc).isoformat()))
 
         if f_type in ("RAW", "E01"):
@@ -234,8 +244,11 @@ def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_va
                     if ext:
                         m = ext.get('m', m); a = ext.get('a', m); c = ext.get('c', m)
                     is_f = 1 if not info.filename.endswith('/') else 0
+                    
+                    normalized_entry = normalize_separators(info.filename)
+                    
                     cursor.execute("INSERT OR IGNORE INTO file_listing VALUES (?,?,?,?,?,?,?,?,?)",
-                                   (os.path.basename(info.filename), os.path.splitext(info.filename)[1], info.filename,
+                                   (os.path.basename(info.filename), os.path.splitext(info.filename)[1], normalized_entry,
                                     format_ts(c), format_ts(m), format_ts(a), is_f, info.file_size, info.compress_size))
         elif f_type in ["TAR", "GZ"]:
             mode = "r:gz" if f_type == "GZ" else "r:*"
@@ -244,8 +257,11 @@ def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_va
                     if mem.isfile() or mem.isdir():
                         m = mem.mtime
                         is_f = 1 if mem.isfile() else 0
+                        
+                        normalized_entry = normalize_separators(mem.name)
+                        
                         cursor.execute("INSERT OR IGNORE INTO file_listing VALUES (?,?,?,?,?,?,?,?,?)",
-                                       (os.path.basename(mem.name), os.path.splitext(mem.name)[1], mem.name,
+                                       (os.path.basename(mem.name), os.path.splitext(mem.name)[1], normalized_entry,
                                         format_ts(m), format_ts(m), format_ts(m), is_f, mem.size, None))
         conn.commit()
         return db_path
@@ -292,9 +308,16 @@ def run_cli(args):
                     db = process_archive_logic(path, out_root, file_id, itype, args.hash, h_val, cli_update)
                     if db:
                         apply_export_choice(db, args.export, cli_update)
-                        entry = [path, itype]
+                        
+                        # Apply normalization to the master log entry as well
+                        normalized_log_path = normalize_separators(path)
+                        entry = [normalized_log_path, itype]
+                        
                         if args.hash: entry.append(h_val)
-                        entry.extend([db, datetime.datetime.now(datetime.timezone.utc).isoformat()])
+                        
+                        normalized_db_path = normalize_separators(db)
+                        entry.extend([normalized_db_path, datetime.datetime.now(datetime.timezone.utc).isoformat()])
+                        
                         m_cursor.execute(f"INSERT INTO processing_log VALUES ({','.join(['?']*len(entry))})", entry)
                         cli_update(f"--- Item Processed ---\n\n")
                         file_id += 1
@@ -405,9 +428,16 @@ if GUI_SUPPORT:
                             h_val = calculate_hash_shared(p, file, file_id, itype, algo, self.log)
                             db = process_archive_logic(p, out_root, file_id, itype, algo, h_val, self.log)
                             if db: apply_export_choice(db, export, self.log)
-                            entry = [p, itype]
+                            
+                            # Apply normalization to the GUI master log entry
+                            normalized_gui_log_path = normalize_separators(p)
+                            entry = [normalized_gui_log_path, itype]
+                            
                             if algo != "None": entry.append(h_val)
-                            entry.extend([db, datetime.datetime.now(datetime.timezone.utc).isoformat()])
+                            
+                            normalized_gui_db_path = normalize_separators(db)
+                            entry.extend([normalized_gui_db_path, datetime.datetime.now(datetime.timezone.utc).isoformat()])
+                            
                             m_cursor.execute(f"INSERT INTO processing_log VALUES ({','.join(['?']*len(entry))})", entry)
                             self.log(f"    --- Item Processed ---\n\n")
                             file_id += 1
