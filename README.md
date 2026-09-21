@@ -83,6 +83,17 @@ segment. That is a different question from the hash of the acquired disk, and
 an E01 records its own MD5 and SHA-1 over the whole disk at acquisition time.
 Those are in `image_metadata.acquisition_md5` and `acquisition_sha1`.
 
+## UPDATE 2026-09-18:
+
+CSV export option, requested by Andrew Rathbun via DFIR Discord (Issue #2).
+
+- `-e`/`--export` on the command line, or the SQLite/CSV/Both selector in the GUI, picks what a run leaves on disk: `sqlite` (the default, unchanged from before), `csv`, or `both`.
+- `csv` and `both` write every table in a database out as its own CSV file, in a `<database name>_csv` folder beside it, for each archive's own database as well as the run's `Arc2Lite_Master_Log.db`.
+- That means a `file_listing.csv` (plus `archive_metadata.csv`, and the `image_*` tables for a disk image) and a `processing_log.csv` come out alongside everything else.
+- `csv` then removes the `.db` files afterward, leaving only the CSVs; `both` keeps everything.
+- The database is still built the same way internally either way — that's what gives `file_listing`
+- its per-path dedup — `csv` just cleans it up once the CSVs are written instead of never building it.
+
 ## UPDATE 2026-03-18:
 GUI and CLI have been combined into one script. If no switches are supplied it will run the GUI.
 
@@ -109,6 +120,9 @@ With v0.0.4 this now handles ZIP and TAR and folder paths, so the script has bee
 usage: arc2lite.py [-h] -i INPUT -o OUTPUT [-r] [-ha {md5,sha1,sha256}]
 
 options:
+   -e, --export {sqlite,csv,both}
+                        Export format for the results: 'sqlite' (default),
+                        'csv', or 'both'
   -h, --help            show this help message and exit
   -i, --input INPUT     ZIP/TAR/GZ archive, raw disk image, .E01 acquisition,
                         or a folder of them
