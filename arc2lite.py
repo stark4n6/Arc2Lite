@@ -36,7 +36,7 @@ except ImportError:
     IMAGE_SUPPORT = False
 
 # --- Global Configurations ---
-arc_version = "v3.1.0"
+arc_version = "v3.1.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "assets", "Arc2Lite.png")
 ICON_PATH = os.path.join(BASE_DIR, "assets", "stark4n6.ico")
@@ -68,6 +68,7 @@ def get_forensic_type(file_path):
             header = f.read(512)
             if header.startswith(b'PK\x03\x04') and ext.endswith('.zip'): return "ZIP"
             if header.startswith(b'\x1f\x8b') and ext.endswith('.gz'): return "GZ"
+            if header.startswith(b'\xfd7zXZ\x00') and ext.endswith('.xz'): return "XZ"
             if header[257:262] == b'ustar' and ext.endswith('.tar'): return "TAR"
     except: return None
     # A raw disk image or an EnCase/EWF acquisition. Decided by reading the
@@ -250,8 +251,8 @@ def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_va
                     cursor.execute("INSERT OR IGNORE INTO file_listing VALUES (?,?,?,?,?,?,?,?,?)",
                                    (os.path.basename(info.filename), os.path.splitext(info.filename)[1], normalized_entry,
                                     format_ts(c), format_ts(m), format_ts(a), is_f, info.file_size, info.compress_size))
-        elif f_type in ["TAR", "GZ"]:
-            mode = "r:gz" if f_type == "GZ" else "r:*"
+        elif f_type in ["TAR", "GZ", "XZ"]:
+            mode = "r:gz" if f_type == "GZ" else ("r:xz" if f_type == "XZ" else "r:*")
             with tarfile.open(file_path, mode, errorlevel=0) as arc:
                 for mem in arc:
                     if mem.isfile() or mem.isdir():
@@ -489,7 +490,7 @@ if __name__ == "__main__":
         print(ascii_art)
         parser = argparse.ArgumentParser()
         parser.add_argument("-i", "--input", required=True,
-                            help="ZIP/TAR/GZ archive, raw disk image, .E01 acquisition, or a folder of them")
+                            help="ZIP/TAR/GZ/XZ archive, raw disk image, .E01 acquisition, or a folder of them")
         parser.add_argument("-o", "--output", required=True, help="Path for the export report")
         parser.add_argument("-r", "--recursive", action="store_true", help="Recursively scan folder for archives"); parser.add_argument("-ha", "--hash", choices=['md5', 'sha1', 'sha256'], help="Optional hashing options")
         parser.add_argument("-e", "--export", choices=["sqlite", "csv", "both"], default="sqlite",
