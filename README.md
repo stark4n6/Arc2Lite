@@ -83,6 +83,16 @@ segment. That is a different question from the hash of the acquired disk, and
 an E01 records its own MD5 and SHA-1 over the whole disk at acquisition time.
 Those are in `image_metadata.acquisition_md5` and `acquisition_sha1`.
 
+## UPDATE 2026-09-24:
+
+Bodyfile/timeline export, for loading Arc2Lite's results into mactime, Plaso, Timesketch or anything else that reads the Sleuth Kit body format.
+
+- `-t/--timeline` on the command line, or the "Also export timeline (.body)" checkbox in the GUI, writes a <database name>.body file beside each archive's or image's own database, in addition to whatever -e/--export produces.
+- It reads straight from that database's file_listing, so it always reflects the same deduplicated rows the database (or its CSV) does, and it runs before -e/--export cleans that database up, so -t csv still gets a bodyfile even though the .db itself is removed afterward.
+- It's per archive/image, not for the run's Arc2Lite_Master_Log.db — a timeline is a property of one piece of evidence, and the master log doesn't have a file_listing of its own to draw one from.
+- Fields Arc2Lite doesn't track (MD5, inode, UID, GID, and change time) are written as 0; size, last-accessed, last-modified and created come straight from file_listing.
+- A FAT/exFAT "stored reading" (see "About the dates" above) is read as the literal digits it was written with, not converted through the host machine's timezone, so the same evidence produces the same bodyfile no matter where Arc2Lite runs.
+
 ## UPDATE 2026-09-18:
 
 CSV export option, requested by Andrew Rathbun via DFIR Discord (Issue #2).
@@ -130,6 +140,9 @@ options:
   -r, --recursive       Recursively scan folder for archives
   -ha, --hash {md5,sha1,sha256}
                         Optional hashing options
+  -t, --timeline        Also write a Sleuth Kit/mactime bodyfile (.body) for
+                        each archive or image processed (not for the master
+                        log)
 ```
 
 ## Tests
