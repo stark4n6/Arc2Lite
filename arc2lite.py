@@ -37,7 +37,7 @@ except ImportError:
     IMAGE_SUPPORT = False
 
 # --- Global Configurations ---
-arc_version = "v3.1.1"
+arc_version = "v3.2.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "assets", "Arc2Lite.png")
 ICON_PATH = os.path.join(BASE_DIR, "assets", "stark4n6.ico")
