@@ -21,6 +21,12 @@ python arc2lite.py -i C:\images -o C:\reports -r
 Nothing is extracted and no file's content is read. Only the directory trees
 are walked, and the image is never written to.
 
+An encrypted image (an encrypted Apple disk image, or an acquisition FTK Imager
+encrypted with AD encryption) opens only with its password, and Arc2Lite does
+not take one. Under a name Arc2Lite reads as an image (`.E01`, a raw image name,
+or the first file of a numbered set) it is still listed: `image_metadata` gets a
+row whose note says it was not read.
+
 | acquisition | entries | time |
 | --- | ---: | ---: |
 | 7.4 GB Windows E01 | 156,894 | 5.9 s |

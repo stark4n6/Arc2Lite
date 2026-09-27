@@ -281,6 +281,62 @@ class Detection(unittest.TestCase):
             self.assertEqual(arc2lite.get_forensic_type(path), "ZIP")
 
 
+class EncryptedImages(unittest.TestCase):
+    """An encrypted image opens only with its password, which Arc2Lite does not
+    take. Under a name Arc2Lite reads as an image it is listed with a note saying
+    so, instead of being passed over. Only the header is needed to tell, so these
+    files are a header and filler."""
+
+    AD_HEADER = b"ADCRYPT\x00"          # FTK Imager AD encryption
+    DMG_HEADER = b"encrcdsa"            # an encrypted Apple disk image
+
+    def _write(self, tmp, name, head):
+        path = os.path.join(tmp, name)
+        with open(path, "wb") as fh:
+            fh.write(head + os.urandom(4096))
+        return path
+
+    def _note(self, tmp, path):
+        db = _index(tmp, path)
+        try:
+            (note, found), = db.execute("SELECT note, volumes_found FROM image_metadata")
+            self.assertEqual(found, 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM file_listing").fetchone()[0], 0)
+            return note
+        finally:
+            db.close()
+
+    def test_an_ad_encrypted_e01_is_listed_as_not_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self._write(tmp, "case.E01", self.AD_HEADER)
+            later = self._write(tmp, "case.E02", b"")
+            self.assertEqual(disk_image.detect(first), "E01")
+            self.assertIsNone(disk_image.detect(later))
+            note = self._note(tmp, first)
+            self.assertIn("AD encryption", note)
+            self.assertIn("not read", note)
+
+    def test_an_ad_encrypted_raw_set_is_listed_once_from_its_first_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self._write(tmp, "set.001", self.AD_HEADER)
+            later = self._write(tmp, "set.002", b"")
+            self.assertEqual(disk_image.detect(first), "RAW")
+            self.assertIsNone(disk_image.detect(later))
+            self.assertIn("not read", self._note(tmp, first))
+
+    def test_an_encrypted_apple_image_under_an_image_name_says_how_to_read_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "locked.img", self.DMG_HEADER)
+            self.assertEqual(disk_image.detect(path), "RAW")
+            note = self._note(tmp, path)
+            self.assertIn("not read", note)
+            self.assertIn("hdiutil convert", note)
+
+    def test_an_e01_that_is_neither_ewf_nor_encrypted_is_not_claimed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(disk_image.detect(self._write(tmp, "notes.E01", b"")))
+
+
 class TheTablesBesideFileListing(unittest.TestCase):
 
     def test_file_listing_keeps_its_shape(self):
