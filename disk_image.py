@@ -17,7 +17,8 @@ Nothing is extracted and no file's content is read. Only the directory trees
 are walked, which is why a 250 GiB acquisition lists in seconds.
 
 Filesystems qnxprobe walks: QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32,
-exFAT, NTFS, HFS+, APFS and QNX IFS boot images.
+exFAT, NTFS, HFS+, APFS, the Linux flash filesystems SquashFS, JFFS2,
+UBI/UBIFS and YAFFS1/YAFFS2, and QNX IFS boot images.
 
 Where the rows go
 -----------------
