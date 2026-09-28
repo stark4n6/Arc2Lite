@@ -16,10 +16,13 @@ library, so Arc2Lite still installs nothing to gain this.
 Nothing is extracted and no file's content is read. Only the directory trees
 are walked, which is why a 250 GiB acquisition lists in seconds.
 
-An encrypted image (an encrypted Apple disk image, or an acquisition FTK Imager
-encrypted with AD encryption) opens only with its password, which Arc2Lite has
-no way to take. One found under a name Arc2Lite reads as an image is listed with
-a note saying it was not read, rather than passed over in silence.
+An encrypted image (an encrypted Apple disk image, an encrypted AFF, or an
+acquisition FTK Imager encrypted with AD encryption) opens only with its password
+or with the private key of a certificate it is sealed to, which Arc2Lite has no
+way to take. One found under a name Arc2Lite reads as an image is listed with a
+note saying it was not read, rather than passed over in silence. A BitLocker
+volume inside an image is listed in image_volumes with the reader's note on why
+it was not read.
 
 Filesystems qnxprobe walks: QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32,
 exFAT, NTFS, HFS+, APFS, the Linux flash filesystems SquashFS, JFFS2,
@@ -165,7 +168,7 @@ def detect(file_path):
         # An .E01 without the EWF signature is claimed only when it is encrypted:
         # FTK Imager's AD encryption writes its own header in place of EWF's. It is
         # claimed so index_image() can say it was not read.
-        return "E01" if qnxprobe.needs_password(file_path) else None
+        return "E01" if _locked_by(file_path) else None
     if not named_image and not _maybe_an_image_name(lowered):
         return None
     try:
@@ -177,7 +180,7 @@ def detect(file_path):
         return "RAW" if named_image else None
     if segments and os.path.abspath(file_path) != os.path.abspath(segments[0]):
         return None
-    if named_image or qnxprobe.needs_password(file_path):
+    if named_image or _locked_by(file_path):
         return "RAW"
     return "RAW" if _holds_a_volume(file_path, segments) else None
 
@@ -473,12 +476,33 @@ def _acquisition(file_path, fh):
     return info
 
 
-def _encrypted_note(file_path):
+# Containers that are encrypted by what they are. Which key opens one is asked of
+# the reader, and it can answer only with the optional pycryptodome package, which
+# Arc2Lite does not install; without it such an image is still encrypted and still
+# not read, so the container's kind decides that it is listed.
+_ENCRYPTED_KINDS = ("DMG_ENCRYPTED", "AD_ENCRYPTED")
+
+
+def _locked_by(file_path):
+    """What an encrypted image opens with, as a sentence names it, or None for one
+    that is not encrypted (and for an encrypted AFF the reader cannot recognise
+    without the optional package, which opening it then reports)."""
+    if qnxprobe.needs_password(file_path):
+        return "its password"
+    if qnxprobe.needs_private_key(file_path):
+        return "the private key of a certificate it is sealed to"
+    if qnxprobe.acquisition_format(file_path) in _ENCRYPTED_KINDS:
+        return "its password or the private key of a certificate it is sealed to"
+    return None
+
+
+def _encrypted_note(file_path, locked_by):
     """Why an encrypted image was not read, and how to get a copy that can be."""
     kind = qnxprobe.acquisition_format(file_path)
     what = {"DMG_ENCRYPTED": "an encrypted Apple disk image",
-            "AD_ENCRYPTED": "encrypted by FTK Imager (AD encryption)"}.get(kind, "encrypted")
-    note = (f"{what}; it opens only with its password, which Arc2Lite does not take, "
+            "AD_ENCRYPTED": "encrypted by FTK Imager (AD encryption)",
+            "AFF": "an encrypted AFF", "AFD": "an encrypted AFF"}.get(kind, "encrypted")
+    note = (f"{what}; it opens only with {locked_by}, which Arc2Lite does not take, "
             f"so it was not read.")
     if kind == "DMG_ENCRYPTED":
         note += (" Attach it on a Mac with the password and image the result, or convert "
@@ -499,10 +523,11 @@ def index_image(file_path, cursor, image_type, update):
     normalized_file_path = normalize_separators(file_path)
 
     # Asked before opening, so the note does not depend on whether this Python has
-    # the optional package ewfprobe decrypts with: without a password it is not
-    # read either way.
-    if qnxprobe.needs_password(file_path):
-        note = _encrypted_note(file_path)
+    # the optional package ewfprobe decrypts with: without its key it is not read
+    # either way.
+    locked_by = _locked_by(file_path)
+    if locked_by:
+        note = _encrypted_note(file_path, locked_by)
         write_image_metadata(cursor, source_file_name=name, source_full_path=normalized_file_path,
                              image_type=image_type, segments="[]", reader=READER,
                              volumes_found=0, volumes_walked=0,

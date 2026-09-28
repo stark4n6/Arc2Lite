@@ -18,6 +18,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -282,10 +283,12 @@ class Detection(unittest.TestCase):
 
 
 class EncryptedImages(unittest.TestCase):
-    """An encrypted image opens only with its password, which Arc2Lite does not
-    take. Under a name Arc2Lite reads as an image it is listed with a note saying
-    so, instead of being passed over. Only the header is needed to tell, so these
-    files are a header and filler."""
+    """An encrypted image opens only with its password, or with the private key of
+    a certificate it is sealed to, and Arc2Lite takes neither. Under a name Arc2Lite
+    reads as an image it is listed with a note saying so, instead of being passed
+    over. The header says an image is encrypted, so these files are a header and
+    filler; which key opens one is the reader's answer, and it is stood in for
+    below where the test is about the wording."""
 
     AD_HEADER = b"ADCRYPT\x00"          # FTK Imager AD encryption
     DMG_HEADER = b"encrcdsa"            # an encrypted Apple disk image
@@ -331,6 +334,29 @@ class EncryptedImages(unittest.TestCase):
             note = self._note(tmp, path)
             self.assertIn("not read", note)
             self.assertIn("hdiutil convert", note)
+
+    def test_an_image_sealed_to_a_certificate_names_its_private_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "sealed.E01", self.AD_HEADER)
+            with mock.patch.object(qnxprobe, "needs_password", return_value=False), \
+                    mock.patch.object(qnxprobe, "needs_private_key", return_value=True):
+                self.assertEqual(disk_image.detect(path), "E01")
+                note = self._note(tmp, path)
+            self.assertIn("the private key of a certificate it is sealed to", note)
+            self.assertNotIn("its password", note)
+
+    def test_an_encrypted_set_is_listed_when_the_reader_cannot_say_what_opens_it(self):
+        """Without the optional pycryptodome package, which Arc2Lite does not
+        install, the reader cannot tell a password from a private key, and says
+        neither is needed. The header still says the set is encrypted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "case.E01", self.AD_HEADER)
+            with mock.patch.object(qnxprobe, "needs_password", return_value=False), \
+                    mock.patch.object(qnxprobe, "needs_private_key", return_value=False):
+                self.assertEqual(disk_image.detect(path), "E01")
+                note = self._note(tmp, path)
+            self.assertIn("its password or the private key", note)
+            self.assertIn("not read", note)
 
     def test_an_e01_that_is_neither_ewf_nor_encrypted_is_not_claimed(self):
         with tempfile.TemporaryDirectory() as tmp:
