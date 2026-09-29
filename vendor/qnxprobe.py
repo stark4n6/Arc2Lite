@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.50"
+QNXPROBE_VERSION = "1.55"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -7131,7 +7131,7 @@ JFFS2_DIRENT, JFFS2_INODE = 0xE001, 0xE002
 JFFS2_CLEANMARKER, JFFS2_PADDING, JFFS2_SUMMARY = 0x2003, 0x2004, 0x2006
 JFFS2_XATTR, JFFS2_XREF = 0xE008, 0xE009
 JFFS2_COMPR = {0: "none", 1: "zero", 2: "rtime", 3: "rubinmips", 4: "copy",
-               5: "dynrubin", 6: "zlib", 7: "lzo"}
+               5: "dynrubin", 6: "zlib", 7: "lzo", 8: "lzma"}
 JFFS2_ROOT_INO = 1
 JFFS2_SCAN_CHUNK = 1 << 22
 
@@ -7262,6 +7262,30 @@ def _jffs2_zlib(src, dsize):
         raise DecompressError(f"zlib: {exc}") from None
 
 
+def _jffs2_lzma(src, dsize):
+    """OpenWrt's JFFS2 LZMA (compression 0x08, not in the mainline kernel): a raw
+    LZMA stream with no header, its properties fixed in the code rather than
+    stored, lc 0, lp 0, pb 0 and an 8 KiB dictionary, decoded to exactly the
+    node's decompressed size, with nothing left over: a stream that stops short,
+    or that would go on past that size (LZMA_STATUS_NOT_FINISHED), is refused
+    (target/linux/generic/pending-6.12/530-jffs2_make_lzma_available.patch at
+    OpenWrt d9f8ecc3, lines 200 to 214 for the decoder and 229 to 237 and 342
+    to 348 for the properties)."""
+    import lzma
+    try:
+        d = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[{
+            "id": lzma.FILTER_LZMA1, "lc": 0, "lp": 0, "pb": 0, "dict_size": 0x2000}])
+        out = d.decompress(src, dsize)
+        more = d.decompress(b"", 1) if len(out) == dsize else b""
+    except lzma.LZMAError as exc:
+        raise DecompressError(f"lzma: {exc}") from None
+    if len(out) != dsize:
+        raise DecompressError(f"lzma gave {len(out):,} bytes where the node records {dsize:,}")
+    if more:
+        raise DecompressError(f"lzma stream runs past the {dsize:,} bytes the node records")
+    return out
+
+
 def jffs2_decompress(compr, src, dsize):
     compr &= 0xFF
     if compr == 0:
@@ -7274,6 +7298,8 @@ def jffs2_decompress(compr, src, dsize):
         return _jffs2_zlib(src, dsize)
     if compr == 7:
         return lzo1x_decompress(src, dsize)[:dsize]
+    if compr == 8:
+        return _jffs2_lzma(src, dsize)
     raise DecompressError(f"JFFS2 compression {JFFS2_COMPR.get(compr, hex(compr))} "
                           "is not read here")
 
@@ -7323,6 +7349,10 @@ class Jffs2Walker:
         # supersedes or frees by clearing one bit; its bytes are untouched).
         self.all_dirents = []                         # (version, pino, name, ino, mctime)
         self.obsolete = []                            # (offset, node type, endian)
+        # For jffs2_filesystems(): where each clean marker and each valid
+        # dirent sits, region-relative (in the spare-stripped view on NAND).
+        self.cleanmarkers = []                        # offset
+        self.dirent_nodes = []                        # (offset, pino, version, ino, dtype, name, mctime)
 
     def _scan(self):
         """Walk the region a 4 MiB chunk at a time, checking every 4-byte
@@ -7378,6 +7408,8 @@ class Jffs2Walker:
         elif ntype == JFFS2_INODE:
             self._inode(off, totlen, e)
         else:
+            if ntype == JFFS2_CLEANMARKER:
+                self.cleanmarkers.append(off)
             self.stats[{JFFS2_CLEANMARKER: "cleanmarker", JFFS2_PADDING: "padding",
                         JFFS2_SUMMARY: "summary", JFFS2_XATTR: "xattr",
                         JFFS2_XREF: "xref"}.get(ntype, "other")] += 1
@@ -7409,6 +7441,7 @@ class Jffs2Walker:
         pino, version, ino, mctime, dtype, name = d
         self.stats["dirent"] += 1
         self.all_dirents.append((version, pino, name, ino, mctime))
+        self.dirent_nodes.append((off, pino, version, ino, dtype, name, mctime))
         cur = self.dirents[pino].get(name)
         if cur is None or version > cur[0]:
             self.dirents[pino][name] = (version, ino, dtype, mctime)
@@ -7510,6 +7543,96 @@ class Jffs2Walker:
         for i in range(0, len(view), 1 << 20):
             yield bytes(view[i:i + (1 << 20)])
 
+    # -- more than one filesystem in the region --------------------------------
+    def node_conflicts(self, unit=1):
+        """(conflicts, links, same_unit, units) for telling apart JFFS2
+        filesystems that sit side by side in one region, with node offsets
+        grouped into units of `unit` bytes.
+
+        Within one filesystem an inode number and version name one node, and a
+        directory's version and the name it records one dirent: the kernel takes
+        each new version as ++highest_version of the inode (fs/jffs2/write.c,
+        fs/jffs2/dir.c, fs/jffs2/gc.c at the commit cited above), garbage
+        collection copies a pristine node as it is (gc.c:696), and the one
+        rewrite that keeps a version, a partly obsoleted hole, keeps its range
+        and takes only the mode bits, size and times anew (gc.c:1030-1098). So
+        two nodes with the same inode number and version but a different file
+        type, range or data CRC, or two dirents with the same parent and version
+        but a different name or target, cannot share a filesystem. `conflicts` is the
+        set of unit pairs holding such nodes, and `same_unit` counts the pairs
+        that fall in one unit, which no split along units can separate. Nodes
+        the kernel marked obsolete count too: their bytes are untouched and they
+        belong to the filesystem that wrote them. `units` is every unit holding
+        a node.
+
+        `links` counts, per unit pair, a dirent and a node of the inode it
+        names, of the file type the dirent records, or of the directory it sits
+        in, whose ctime or mtime is the dirent's mctime. The kernel writes a new
+        file's name with the new inode's ctime (write.c:518 jffs2_do_create); for
+        a symlink, directory or device it reads the clock again for the name a
+        moment after the inode (dir.c:412, 557, 733; fs.c:479), so the two
+        usually agree to the second; and it gives the directory the name's time
+        (dir.c:430-431), which the directory's next inode node carries. A name
+        meeting a number the other filesystem also uses almost never matches.
+        Only inode numbers that carry no conflicting node and no second file
+        type count."""
+        sigs = collections.defaultdict(lambda: collections.defaultdict(set))
+        for ino, nodes in self.inodes.items():
+            for n in nodes:
+                sigs[("i", ino, n["version"])][(n["mode"] & S_IFMT, n["doff"], n["dsize"],
+                                                  n["data_crc"])].add(n["off"] // unit)
+        for off, pino, version, ino, _dt, name, _mct in self.dirent_nodes:
+            sigs[("d", pino, version)][(name, ino)].add(off // unit)
+        for off, ntype, e in self.obsolete:
+            totlen = struct.unpack(e + "HHII", read_at(self.fh, self.base + off, 12))[2]
+            if ntype == JFFS2_INODE:
+                got = self._parse_inode(off, totlen, e, obsolete=True)
+                if got:
+                    ino, n = got
+                    sigs[("i", ino, n["version"])][(n["mode"] & S_IFMT, n["doff"], n["dsize"],
+                                                    n["data_crc"])].add(off // unit)
+            else:
+                d = self._parse_dirent(off, totlen, e, obsolete=True)
+                if d:
+                    pino, version, ino, _mct, _dt, name = d
+                    sigs[("d", pino, version)][(name, ino)].add(off // unit)
+        units = {u for by_sig in sigs.values() for held in by_sig.values() for u in held}
+        conflicts, same_unit, reused = set(), 0, set()
+        for key, by_sig in sigs.items():
+            if len(by_sig) < 2:
+                continue
+            if key[0] == "i":
+                reused.add(key[1])
+            groups = list(by_sig.values())
+            for i, first in enumerate(groups):
+                for second in groups[i + 1:]:
+                    for u in first:
+                        for v in second:
+                            if u == v:
+                                same_unit += 1
+                            else:
+                                conflicts.add((min(u, v), max(u, v)))
+        for ino, nodes in self.inodes.items():
+            if len({n["mode"] & S_IFMT for n in nodes}) > 1:
+                reused.add(ino)
+        dtype_mode = {4: S_IFDIR, 8: S_IFREG, 10: S_IFLNK}
+        links = collections.Counter()
+        for off, pino, _version, ino, dtype, _name, mctime in self.dirent_nodes:
+            u = off // unit
+            ends = []
+            if ino and ino not in reused:
+                ends += [n for n in self.inodes.get(ino, ())
+                         if n["mode"] & S_IFMT == dtype_mode.get(dtype)
+                         and mctime in (n["ctime"], n["mtime"])]
+            if pino not in reused:
+                ends += [n for n in self.inodes.get(pino, ())
+                         if n["mode"] & S_IFMT == S_IFDIR and mctime in (n["ctime"], n["mtime"])]
+            for n in ends:
+                v = n["off"] // unit
+                if v != u:
+                    links[(min(u, v), max(u, v))] += 1
+        return conflicts, links, same_unit, units
+
 
     # -- deleted files ---------------------------------------------------------
     def recover_deleted(self):
@@ -7593,6 +7716,89 @@ class Jffs2Walker:
             yield bytes(view[i:i + (1 << 20)])
 
 JFFS2_LEAD_MAX = 64 << 20      # how much erased flash may come before the first node
+
+
+JFFS2_SPLIT_MAX_UNITS = 2048
+
+
+def jffs2_filesystems(fh, base, size):
+    """[(base, size)] of the JFFS2 filesystems in a region, in order.
+
+    A flash dump with no partition table can hold two JFFS2 partitions side by
+    side (an OpenWrt overlay and a vendor's settings, for example), and read as
+    one region they mix: each filesystem numbers its inodes and versions from
+    1, so a name from one would show the content of the other's file of the
+    same number. Nodes that cannot share a filesystem (Jffs2Walker.
+    node_conflicts) say the region holds more than one. It is then cut, along
+    erase blocks, into contiguous pieces with no conflict inside any of them,
+    choosing the cut that separates the fewest dirents from the inodes and
+    directories they name. A partition is a contiguous run of erase blocks. A
+    region with no conflicts, or one that cannot be cut cleanly, is returned
+    whole.
+
+    The erase block is the spacing of the clean markers the kernel writes at
+    the start of each erased block (their greatest common divisor); with none
+    (on NAND they live in the spare bytes) 4 KiB, no larger than any erase
+    block, is the unit."""
+    import math
+    whole = [(base, size)]
+    try:
+        w = Jffs2Walker(fh, base, size)
+    except (Jffs2Unreadable, OSError, struct.error):
+        return whole
+    unit = 0
+    for off in w.cleanmarkers:
+        unit = math.gcd(unit, off)
+    # A whole page at least, so a boundary in the spare-stripped view maps to
+    # the start of a page in the image (image_offset below).
+    page = w.nand[0] if w.nand else 1
+    unit = max(unit if unit >= 4096 else 4096, page)
+    conflicts, links, same_unit, held = w.node_conflicts(unit)
+    if not conflicts or same_unit:
+        return whole
+    units = sorted(held)
+    m = len(units)
+    if m > JFFS2_SPLIT_MAX_UNITS:
+        return whole
+    at = {u: i for i, u in enumerate(units)}
+    last_conflict = [-1] * m                    # latest earlier unit it conflicts with
+    for u, v in conflicts:
+        last_conflict[at[v]] = max(last_conflict[at[v]], at[u])
+    earlier = collections.defaultdict(list)     # unit index -> [(earlier index, links)]
+    for (u, v), count in links.items():
+        earlier[at[v]].append((at[u], count))
+    # best[i] = (links cut, pieces, start of the last piece) for units[:i]
+    best = [None] * (m + 1)
+    best[0] = (0, 0, 0)
+    for a in range(m):
+        if best[a] is None:
+            continue
+        cut, reach = best[a][0], -1
+        for b in range(a, m):
+            reach = max(reach, last_conflict[b])
+            if reach >= a:
+                break
+            cut += sum(c for i, c in earlier[b] if i < a)
+            cand = (cut, best[a][1] + 1, a)
+            if best[b + 1] is None or cand[:2] < best[b + 1][:2]:
+                best[b + 1] = cand
+    if best[m] is None or best[m][1] < 2:
+        return whole
+    starts, i = [], m
+    while i > 0:
+        starts.append(best[i][2])
+        i = best[i][2]
+    starts.reverse()
+
+    def image_offset(view_off):
+        if w.nand:
+            pg, spare = w.nand
+            return (view_off // pg) * (pg + spare)
+        return view_off
+    # Each piece opens at the first unit holding its own nodes, so a piece holds
+    # exactly the units the split gave it and no conflicting pair.
+    bounds = [0] + [image_offset(units[s] * unit) for s in starts[1:]] + [size]
+    return [(base + lo, hi - lo) for lo, hi in zip(bounds, bounds[1:])]
 
 
 def _jffs2_first_node(fh, base, size):
@@ -7694,7 +7900,7 @@ def identify_jffs2(fh, base, size=None):
     if orphans:
         lines.append(f"note         {orphans:,} linked names lead to an inode with no readable "
                      "node; they are not listed")
-    unread = [c for c in comps if c not in ("none", "zero", "rtime", "zlib", "lzo")]
+    unread = [c for c in comps if c not in ("none", "zero", "rtime", "zlib", "lzo", "lzma")]
     if unread:
         lines.append(f"note         {', '.join(unread)} compressed data is not read here")
     return "jffs2", lines
@@ -7740,6 +7946,59 @@ def _ubi_crc(data):
     with no final inversion, which is zlib's crc32 with its output inverted."""
     import zlib
     return zlib.crc32(data) ^ 0xFFFFFFFF
+
+
+_CRC32_TABLE = []
+# The shortest CRC-32 codeword of weight three is 91,640 bits long (the self-test
+# finds it), so on a message of at most 11,450 bytes two flipped bits never give
+# the CRC change one flipped bit gives, and a one-bit repair cannot turn a
+# two-bit error into wrong bytes. UBIFS nodes are far shorter.
+CRC32_ONE_BIT_MAX = 11450
+
+
+def crc32_one_bit(data, want):
+    """(byte, bit) of the single bit whose flip gives `data` the zlib-style CRC-32
+    `want`, or None. A raw NAND dump holds the bits as the cells gave them, before
+    the controller's ECC corrected them, so a node the device read cleanly can
+    fail its CRC here by one flipped bit. CRC-32 is linear, so the change a flip
+    at each position makes to the CRC is computed once per position (a register
+    started at zero and clocked through the zero bytes after it) and compared
+    with the change needed; for the lengths flash nodes have, two different
+    single-bit flips never give the same change, so at most one position fits
+    (no two collide within 2 MB, measured)."""
+    import zlib
+    if not _CRC32_TABLE:
+        for n in range(256):
+            c = n
+            for _ in range(8):
+                c = (c >> 1) ^ 0xEDB88320 if c & 1 else c >> 1
+            _CRC32_TABLE.append(c)
+    t = _CRC32_TABLE
+    need = zlib.crc32(data) ^ want
+    if not need:
+        return None
+    states = [t[1 << b] for b in range(8)]
+    for k in range(len(data) - 1, -1, -1):
+        if need in states:
+            return k, states.index(need)
+        states = [t[x & 0xFF] ^ (x >> 8) for x in states]
+    return None
+
+
+def _ubifs_repair(raw):
+    """`raw` (a UBIFS node whose CRC failed) with one bit restored, or None. A
+    flip inside the stored CRC itself leaves the node's bytes as they are."""
+    if len(raw) - 8 > CRC32_ONE_BIT_MAX:
+        return None
+    stored = struct.unpack_from("<I", raw, 4)[0]
+    if bin(stored ^ _ubi_crc(raw[8:])).count("1") == 1:
+        return bytes(raw)
+    fix = crc32_one_bit(raw[8:], stored ^ 0xFFFFFFFF)
+    if fix is None:
+        return None
+    fixed = bytearray(raw)
+    fixed[8 + fix[0]] ^= 1 << fix[1]
+    return bytes(fixed)
 
 
 def _ubi_ec(raw):
@@ -7830,9 +8089,14 @@ class UbiImage:
         for key, vids in cands.items():
             vids.sort(key=lambda v: v["sqnum"], reverse=True)
             for i, v in enumerate(vids):
-                if v["copy_flag"] and not self._data_ok(v):
+                # The kernel checks a copy's data CRC only against another copy
+                # of the same LEB (attach.c ubi_compare_lebs); a LEB seen once is
+                # attached as it is (ubi_add_to_av).
+                if v["copy_flag"] and i + 1 < len(vids) and not self._data_ok(v):
                     self.stats["copy with a bad data CRC, older copy used"] += 1
                     continue
+                if v["copy_flag"] and i + 1 == len(vids) and not self._data_ok(v):
+                    self.stats["copy with a bad data CRC, the only copy, used"] += 1
                 self.map[key] = v
                 # An older copy still on the flash (left by a rewrite or a move
                 # that was cut short) holds that block's earlier contents.
@@ -8070,6 +8334,9 @@ def identify_ubi(fh, base, size=None):
         lines.append(f"volume {vol['id']:<5} {vol['name'] or '(no name)'}: "
                      f"{UBI_VOL_NAMES.get(vol['type'], 'unknown')}, {human(view.size)}, {kind}"
                      + ("; interrupted update marker set" if vol["update_marker"] else ""))
+        if getattr(walker, "bit_repairs", None):
+            lines.append(UBIFS_BIT_REPAIR_NOTE.format(
+                n=len(walker.bit_repairs), where=f" in volume {vol['id']}"))
     odd = {k: v for k, v in u.stats.items() if k not in ("mapped", "free")}
     for k, v in sorted(odd.items()):
         lines.append(f"note         {v:,} eraseblock(s): {k}")
@@ -8101,6 +8368,9 @@ def identify_ubi(fh, base, size=None):
 #   a missing data block is a hole            fs/ubifs/file.c read_block
 # ---------------------------------------------------------------------------
 UBIFS_MAGIC = 0x06101831
+UBIFS_BIT_REPAIR_NOTE = ("bit errors   {n:,} node(s){where} failed their CRC by one flipped bit "
+                         "and were read with that bit restored, as the NAND controller's "
+                         "ECC would have done")
 (UBIFS_INO_NODE, UBIFS_DATA_NODE, UBIFS_DENT_NODE, UBIFS_XENT_NODE, UBIFS_TRUN_NODE,
  UBIFS_PAD_NODE, UBIFS_SB_NODE, UBIFS_MST_NODE, UBIFS_REF_NODE, UBIFS_IDX_NODE,
  UBIFS_CS_NODE) = range(11)
@@ -8155,6 +8425,8 @@ class UbifsWalker:
     def __init__(self, fh, base):
         self.fh, self.base = fh, base
         self.leb_size = 0                      # LEB 0 is read before the size is known
+        self.stats = collections.Counter()
+        self.bit_repairs = set()               # (lnum, offs) of nodes read with one bit restored
         sb = self._node(0, 0)
         if sb is None or sb[20] != UBIFS_SB_NODE:
             raise UbifsUnreadable("no UBIFS superblock node at LEB 0")
@@ -8170,7 +8442,6 @@ class UbifsWalker:
         self.master = self._master()
         if self.master is None:
             raise UbifsUnreadable("no master node reads in LEB 1 or 2")
-        self.stats = collections.Counter()
         self.inodes, self.data, self.dents = {}, collections.defaultdict(dict), \
             collections.defaultdict(dict)
         self._walk_index()
@@ -8188,11 +8459,26 @@ class UbifsWalker:
         if nlen < 24 or nlen > 1 << 20 or (length is not None and nlen != length):
             return None
         raw = read_at(self.fh, at, nlen)
-        if len(raw) < nlen or _ubi_crc(raw[8:]) != struct.unpack_from("<I", raw, 4)[0]:
+        if len(raw) < nlen:
             return None
+        if _ubi_crc(raw[8:]) != struct.unpack_from("<I", raw, 4)[0]:
+            raw = _ubifs_repair(raw)
+            if raw is None:
+                return None
+            self.bit_repairs.add((lnum, offs))
         if want is not None and raw[20] != want:
             return None
         return raw
+
+    def _unread(self, blk, lnum, offs):
+        """Why the data node for `blk` at lnum:offs did not read."""
+        head = read_at(self.fh, self.base + lnum * self.leb_size + offs, 24)
+        where = f"data node for block {blk} (LEB {lnum}, offset {offs:,})"
+        if head[:4] == b"\xff" * 4:
+            return f"{where} is erased flash: no copy of it is in the image"
+        if len(head) == 24 and struct.unpack_from("<I", head, 0)[0] == UBIFS_MAGIC:
+            return f"{where} fails its CRC, by more than one flipped bit"
+        return f"{where} does not read"
 
     def _scan_leb(self, lnum, offs):
         """Every valid node in LEB lnum from offs on, as (offs, raw), stepping
@@ -8214,9 +8500,13 @@ class UbifsWalker:
                 continue
             nlen = struct.unpack_from("<I", buf, offs + 16)[0]
             raw = buf[offs:offs + nlen]
-            if nlen < 24 or len(raw) < nlen or \
-                    _ubi_crc(raw[8:]) != struct.unpack_from("<I", raw, 4)[0]:
+            if nlen < 24 or len(raw) < nlen:
                 break
+            if _ubi_crc(raw[8:]) != struct.unpack_from("<I", raw, 4)[0]:
+                raw = _ubifs_repair(raw)
+                if raw is None:
+                    break
+                self.bit_repairs.add((lnum, offs))
             if raw[20] == UBIFS_PAD_NODE:
                 offs += nlen + struct.unpack_from("<I", raw, 24)[0]
                 continue
@@ -8412,7 +8702,7 @@ class UbifsWalker:
             else:
                 raw = self._node(loc[0], loc[1], loc[2], UBIFS_DATA_NODE)
                 if raw is None:
-                    raise UbifsUnreadable(f"data node for block {blk} does not read")
+                    raise UbifsUnreadable(self._unread(blk, loc[0], loc[1]))
                 dsize, ctype = struct.unpack_from("<IH", raw, 40)
                 out = ubifs_decompress(ctype, raw[48:], UBIFS_BLOCK)
                 if len(out) != dsize:
@@ -8507,7 +8797,7 @@ class UbifsWalker:
             lnum, offs, nlen = blocks[blk]
             raw = self._node(lnum, offs, nlen, UBIFS_DATA_NODE)
             if raw is None:
-                raise UbifsUnreadable(f"data node for block {blk} does not read")
+                raise UbifsUnreadable(self._unread(blk, lnum, offs))
             dsize, ctype = struct.unpack_from("<IH", raw, 40)
             out = ubifs_decompress(ctype, raw[48:], UBIFS_BLOCK)
             if len(out) != dsize:
@@ -8560,6 +8850,8 @@ def ubifs_lines(w):
               "log does not open with this commit"):
         if w.stats[k]:
             lines.append(f"damaged      {w.stats[k]:,} {k}")
+    if w.bit_repairs:
+        lines.append(UBIFS_BIT_REPAIR_NOTE.format(n=len(w.bit_repairs), where=""))
     return lines
 
 
@@ -9686,7 +9978,7 @@ class ProgressEmitter:
         self.stream.flush()
 
 
-def extract_to_zip(zf, w, volume, entries, log, progress=None, may_be_short=False):
+def extract_to_zip(zf, w, volume, entries, log, progress=None):
     """Stream each regular file into the open zipfile. Returns a tally.
 
     Returns (files, written, skipped, failed, short). progress, when given, is
@@ -9698,12 +9990,17 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, may_be_short=Fals
     A file whose blocks lie past the end of the image is a SHORT read: read_at()
     answers a seek past the end of the file with empty bytes, so the walker
     hands back fewer bytes than the inode says and raises nothing. Such a file
-    is counted in short, not in files, and logged. With may_be_short, which the
-    caller passes when it already knows this volume reaches past the end of the
-    image, each file is spooled before it is written so a short one can be
-    stored under a name that says how much of it is here. On a volume with no
-    reason to expect it the file streams straight into the zip; a short one
-    then keeps its name, and the count and the log still say it was short.
+    is counted in short, not in files, and logged, and it is stored under a name
+    that says how much of it is here: <path>.SHORT-<got>-of-<size>-bytes.
+
+    Each file is read in full into a spool before anything is written, because
+    zipfile cannot remove a member once it is written. A file whose read raises
+    partway is therefore left out of the zip entirely, counted in failed and
+    logged with the reason; streaming it would have left a member holding only
+    the bytes read so far under the file's real name, which a reader of the zip
+    cannot tell from an ordinary, shorter file. The spool stays in memory up to
+    32 MiB and moves to a temporary file above that, so a larger file is written
+    to disk twice and needs its own size free in the temporary folder.
     """
     import shutil
     import tempfile
@@ -9721,23 +10018,17 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, may_be_short=Fals
             info.external_attr = 0o100644 << 16
             got = 0
             before = EOF_SHORTFALL["bytes"]
-            if may_be_short:
-                with tempfile.SpooledTemporaryFile(max_size=32 << 20) as spool:
-                    for chunk in w.read_file(ino, size):
-                        spool.write(chunk)
-                        got += len(chunk)
-                    got = min(got, max(size - (EOF_SHORTFALL["bytes"] - before), 0))
-                    if got < size:
-                        info.filename = f"{arc}.SHORT-{got}-of-{size}-bytes"
-                    spool.seek(0)
-                    with zf.open(info, "w") as dst:
-                        shutil.copyfileobj(spool, dst)
-            else:
-                with zf.open(info, "w") as dst:
-                    for chunk in w.read_file(ino, size):
-                        dst.write(chunk)
-                        got += len(chunk)
+            with tempfile.SpooledTemporaryFile(max_size=32 << 20) as spool:
+                for chunk in w.read_file(ino, size):
+                    spool.write(chunk)
+                    got += len(chunk)
+                # Only now, with the whole file read, does anything reach the zip.
                 got = min(got, max(size - (EOF_SHORTFALL["bytes"] - before), 0))
+                if got < size:
+                    info.filename = f"{arc}.SHORT-{got}-of-{size}-bytes"
+                spool.seek(0)
+                with zf.open(info, "w") as dst:
+                    shutil.copyfileobj(spool, dst)
             # A walker pads a block the image ends inside with zeros, so the bytes
             # it handed back are not the bytes that were there; the shortfall
             # read_at() tallied while this file was read is.
@@ -9930,6 +10221,13 @@ def walker_for(kind, fh, base, size=None):
         return _cached_walker(fh, base, size, kind, lambda: Jffs2Walker(fh, base, size))
     if kind in ("yaffs1", "yaffs2"):
         return _cached_walker(fh, base, size, kind, lambda: YaffsWalker(fh, base, size))
+    room = CFG_STORE_MAX if size is None else size
+    if kind == "nvram":
+        st = nvram_store(fh, base, room)
+        return ConfigStoreWalker(fh, base, st[0], "nvram.bin") if st else None
+    if kind == "uboot-env":
+        st = uboot_env_store(fh, base, room)
+        return ConfigStoreWalker(fh, base, st[0], "uboot-env.bin") if st else None
     return None
 
 
@@ -11104,6 +11402,13 @@ def identify_fs(fh, base, size=None):
     if bde:
         return bde
 
+    # The configuration stores a flash chip carries beside its filesystems. Each
+    # is accepted only on a CRC-32 that holds over the store.
+    for ident in (identify_nvram, identify_uboot_env):
+        found = ident(fh, base, size)
+        if found:
+            return found
+
     sb = read_at(fh, base + EXT_SB_OFF, 1024)
     if len(sb) == 1024 and _e(sb, "magic", 2) == EXT_MAGIC:
         bs = 1024 << _e(sb, "log_block_size")
@@ -11259,6 +11564,177 @@ def volume_name(part_idx, lba, label=""):
 EXT_PARTITION_TYPES = (0x05, 0x0f, 0x85)
 
 
+# ---------------------------------------------------------------------------
+# Configuration stores on flash
+#
+# A flash chip also carries name=value stores that are not filesystems: the
+# U-Boot environment, and on Belkin WeMo devices Belkin's libnvram store. The
+# report names a store by its layout, which does not say which program wrote it.
+# Neither has a directory, so each is given as a volume holding one file, the
+# store's bytes as they sit on the chip, for a consumer to parse. Both are
+# accepted only on a CRC-32 that holds over the store, and a store's size is the
+# one its CRC holds for, tried in 4 KiB steps up to CFG_STORE_MAX.
+#
+# U-Boot's environment layout, env_t in include/env_internal.h at v2024.01
+# (https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/include/env_internal.h#L80-L86):
+# a little-endian CRC-32, a flags byte only when the board keeps a redundant copy
+# (ENV_HEADER_SIZE, lines 59-61), then CONFIG_ENV_SIZE less that header of
+# NUL-separated name=value strings ending in an empty one. env_import() checks
+# crc32(0, data, ENV_SIZE) before it reads them
+# (https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/common.c#L310).
+#
+# Belkin libnvram store, env_image_gemtek in Belkin's own libnvram source (its
+# header carries Belkin's copyright), as found in a public copy of the WeMo firmware
+# tree (https://github.com/svenschwermer/wemo/blob/46d0ccd248806e8e07210f9b34166b127e9d3d52/package/belkin_nvram_bd/src/libnvram.c#L97-L108):
+# "NVRM", a CRC-32, an entry count and the offset of the end of the data, then
+# NUL-separated name=value strings. The CRC covers the partition less the
+# 16-byte header (lines 853-874); the count and end of data are written after it,
+# from the index of strings (lines 420-450 and 1165-1178).
+# ---------------------------------------------------------------------------
+CFG_STORE_MAX = 256 << 10         # the largest store size tried
+CFG_KINDS = ("nvram", "uboot-env")
+NVRM_MAGIC = b"NVRM"
+NVRM_HEADER = 16
+_CFG_NAME = re.compile(rb"[A-Za-z0-9_.:+-]{1,64}=")   # what a store's first string opens with
+
+
+def _cfg_crc_size(fh, base, start, crc, room):
+    """The smallest size, a multiple of 4 KiB and at most room and CFG_STORE_MAX,
+    for which the CRC-32 of the bytes from base + start to base + size is crc,
+    or None. One read and one pass, whatever the number of sizes tried."""
+    buf = read_at(fh, base, max(0, min(room, CFG_STORE_MAX)))
+    c, done = 0, start
+    for size in range(FLASH_ALIGN, len(buf) + 1, FLASH_ALIGN):
+        if size <= start:
+            continue
+        c = binascii.crc32(buf[done:size], c)
+        done = size
+        if c == crc:
+            return size
+    return None
+
+
+def cfg_strings(data):
+    """(strings, ended): the NUL-separated strings of a store's data, up to the
+    first empty one, and whether that empty one was found inside data."""
+    items, pos = [], 0
+    while pos < len(data):
+        end = data.find(b"\x00", pos)
+        if end < 0:
+            return items, False
+        if end == pos:
+            return items, True
+        items.append(data[pos:end])
+        pos = end + 1
+    return items, False
+
+
+def nvram_store(fh, base, room):
+    """(size, count, eod) for a libnvram store at base whose CRC-32 holds, else
+    None. count and eod are as the header stores them; the CRC does not cover
+    them, and libnvram rebuilds both from the strings, so they are reported and
+    not checked."""
+    head = read_at(fh, base, NVRM_HEADER)
+    if len(head) < NVRM_HEADER or head[:4] != NVRM_MAGIC:
+        return None
+    crc, count, eod = struct.unpack_from("<III", head, 4)
+    size = _cfg_crc_size(fh, base, NVRM_HEADER, crc, room)
+    if size is None:
+        return None
+    return size, count, eod
+
+
+def uboot_env_store(fh, base, room):
+    """(size, header, flags) for a U-Boot environment at base whose CRC-32 holds
+    and whose strings end inside it, else None. header is 4 for a single copy and
+    5 for one of a redundant pair, whose flags byte is returned (else None)."""
+    head = read_at(fh, base, 5 + 65)
+    if len(head) < 8:
+        return None
+    crc = struct.unpack_from("<I", head)[0]
+    for hdr in (4, 5):
+        if not _CFG_NAME.match(head, hdr):
+            continue
+        size = _cfg_crc_size(fh, base, hdr, crc, room)
+        if size is None:
+            continue
+        strings, ended = cfg_strings(read_at(fh, base + hdr, size - hdr))
+        if ended and strings:
+            return size, hdr, (head[4] if hdr == 5 else None)
+    return None
+
+
+def _erased_after(fh, start, end):
+    """True when every byte from start to end (or the end of the image) is 0xFF."""
+    pos = start
+    while pos < end:
+        chunk = read_at(fh, pos, min(1 << 20, end - pos))
+        if not chunk:
+            return True
+        if chunk.strip(b"\xff"):
+            return False
+        pos += len(chunk)
+    return True
+
+
+def identify_nvram(fh, base, size):
+    """Return ("nvram", lines) for a libnvram store at base that fills the region
+    or is followed only by erased flash, else None."""
+    st = nvram_store(fh, base, size)
+    if not st or not _erased_after(fh, base + st[0], base + size):
+        return None
+    n, count, eod = st
+    strings, _ = cfg_strings(read_at(fh, base + NVRM_HEADER, n - NVRM_HEADER))
+    return "nvram", [
+        "format       Belkin libnvram store (NVRM header), CRC-32 holds",
+        f"store        {human(n)}, {len(strings)} name=value strings "
+        f"(header count {count}, end of data at {eod})",
+        "file         nvram.bin, the store's bytes as held on flash"]
+
+
+def identify_uboot_env(fh, base, size):
+    """Return ("uboot-env", lines) for a U-Boot environment at base that fills
+    the region or is followed only by erased flash, else None. The second
+    condition keeps a dump that merely begins with an environment from being
+    taken for one, so its other regions are still searched (flash_regions)."""
+    st = uboot_env_store(fh, base, size)
+    if not st or not _erased_after(fh, base + st[0], base + size):
+        return None
+    n, hdr, flags = st
+    strings, _ = cfg_strings(read_at(fh, base + hdr, n - hdr))
+    layout = ("a 4-byte header, the single-copy layout" if hdr == 4 else
+              f"a 5-byte header, the redundant-copy layout (flags byte {flags})")
+    return "uboot-env", [
+        "format       U-Boot's environment layout (env_t), CRC-32 holds; the layout "
+        "does not say which program wrote the store",
+        f"store        {human(n)}, {layout}, {len(strings)} name=value strings",
+        "file         uboot-env.bin, the store's bytes as held on flash"]
+
+
+class ConfigStoreWalker:
+    """A configuration store as a volume holding one file: the store's bytes, as
+    held on flash, under name. It records no time, so none is reported."""
+    root = 1
+    _FILE = 2
+
+    def __init__(self, fh, base, size, name):
+        self.fh, self.base, self.size, self.name = fh, base, size, name
+
+    def listdir(self, node):
+        return [(self.name, self._FILE)] if node == self.root else []
+
+    def entry(self, node):
+        if node == self.root:
+            return (S_IFDIR | 0o555, 0, None)
+        if node == self._FILE:
+            return (S_IFREG | 0o444, self.size, None)
+        return None
+
+    def read_file(self, node, size):
+        if node == self._FILE:
+            yield read_at(self.fh, self.base, min(size, self.size))
+
+
 # A raw NOR or NAND dump has no partition table: the kernel learns the MTD
 # partitions from the device tree or its command line, which the dump does not
 # carry. The bootloader usually sits at offset 0, so nothing is recognised
@@ -11267,6 +11743,40 @@ EXT_PARTITION_TYPES = (0x05, 0x0f, 0x85)
 # checks it, and each given its own extent.
 FLASH_SCAN_MAX = 8 << 30          # a bigger unpartitioned image is not a flash chip
 FLASH_ALIGN = 4096                # every eraseblock size is a multiple of this
+
+
+def _ext_primary_size(fh, off, room):
+    """The byte size of the ext2/3/4 filesystem whose primary superblock is at
+    off + 1024, or None if what sits there is not one.
+
+    The magic is two bytes, which data of any kind carries by chance, so the
+    filesystem behind it has to read: its root directory, inode 2, has to come
+    back as a directory through the group descriptors (struct ext4_super_block
+    and ext4_group_desc, fs/ext4/ext4.h). Two fields are checked first. The
+    block size has to be 1 to 64 KiB: it is computed as 1024 shifted by a
+    stored number, and a random one builds an integer of hundreds of megabytes
+    (480 MiB for 0xF0000000) before the read behind it fails. And the
+    superblock has to name block group 0 (s_block_group_nr at 0x5A): a backup
+    copy names its own group, and a copy of the filesystem behind it can read
+    as well as the real one.
+    """
+    sb = read_at(fh, off + EXT_SB_OFF, 1024)
+    if len(sb) < 1024 or _e(sb, "magic", 2) != EXT_MAGIC:
+        return None
+    lbs = _e(sb, "log_block_size")
+    if lbs > 6 or int.from_bytes(sb[0x5A:0x5C], "little") != 0:
+        return None
+    bs = 1024 << lbs
+    blocks = _e(sb, "blocks_count")
+    if _e(sb, "feature_incompat") & 0x80:                     # EXT4_FEATURE_INCOMPAT_64BIT
+        blocks |= int.from_bytes(sb[0x150:0x154], "little") << 32
+    try:
+        root = ExtWalker(fh, off).entry(2)
+    except Exception:
+        return None
+    if not root or root[0] & S_IFMT != S_IFDIR:
+        return None
+    return min(blocks * bs, room) or None
 
 
 def flash_regions(fh, size):
@@ -11279,7 +11789,25 @@ def flash_regions(fh, size):
                 the following eraseblocks that carry a header of the same
                 image_seq or are erased
       JFFS2     a node whose header CRC holds; JFFS2 has no size of its own, so
-                its extent runs to the next filesystem found, or the end
+                its extent runs to the next filesystem found, or the end, and a
+                region holding two JFFS2 partitions side by side is cut into
+                them (jffs2_filesystems)
+      ext2/3/4  a primary superblock (block group 0) whose root directory reads
+                (_ext_primary_size); its extent is the block count it records.
+                An eMMC image from an embedded device can hold its partitions
+                with no table the image carries (the kernel can take the layout
+                from its command line, blkdevparts= in block/partitions/
+                cmdline.c), and its writable data can sit in ext4 there
+      NVRM      a Belkin libnvram store whose CRC-32 holds (nvram_store); its
+                extent is the size that CRC holds for
+      U-Boot    an environment whose first string opens with a name and "="
+                and whose CRC-32 holds (uboot_env_store); its extent likewise
+
+    A configuration store is not a filesystem, but it has an extent of its own
+    and sits in its own MTD partition, so a JFFS2 in front of it ends there.
+    A backup superblock names its own block group, so it is never taken for a
+    filesystem, and a hit inside a filesystem already found (an ext image kept
+    as a file, a backup copy) is skipped.
 
     Returns [] when the image is larger than FLASH_SCAN_MAX or holds none."""
     if size > FLASH_SCAN_MAX:
@@ -11288,15 +11816,21 @@ def flash_regions(fh, size):
     step = 1 << 20
     pos = 0
     while pos < size:
-        chunk = read_at(fh, pos, min(step + 16, size - pos))
+        chunk = read_at(fh, pos, min(step + EXT_SB_OFF + 64, size - pos))
         if not chunk:
             break
-        for magic in (b"hsqs", b"UBI#", b"\x85\x19", b"\x19\x85"):
+        for magic in (b"hsqs", b"UBI#", b"\x85\x19", b"\x19\x85", NVRM_MAGIC):
             j = chunk.find(magic)
             while 0 <= j < step:
                 if (pos + j) % FLASH_ALIGN == 0:
                     hits.add((pos + j, magic))
                 j = chunk.find(magic, j + 1)
+        m = EXT_SB_OFF + EXT_F["magic"]                # pos is a multiple of FLASH_ALIGN
+        for k in range(0, min(step, len(chunk) - m - 1), FLASH_ALIGN):
+            if chunk[k + m:k + m + 2] == b"\x53\xef":
+                hits.add((pos + k, b"ext"))
+            if _CFG_NAME.match(chunk, k + 4) or _CFG_NAME.match(chunk, k + 5):
+                hits.add((pos + k, b"env"))       # a U-Boot environment's first string
         pos += step
     found, taken_to = [], 0
     for off, magic in sorted(hits):
@@ -11324,6 +11858,24 @@ def flash_regions(fh, size):
                 else:
                     break
             found.append(["ubi", off, end - off])
+        elif magic == b"ext":
+            ext = _ext_primary_size(fh, off, size - off)
+            if not ext:
+                continue
+            kind = identify_fs(fh, off, ext)[0]
+            if not (kind or "").startswith("ext"):
+                continue
+            found.append([kind, off, ext])
+        elif magic == NVRM_MAGIC:
+            st = nvram_store(fh, off, size - off)
+            if not st:
+                continue
+            found.append(["nvram", off, st[0]])
+        elif magic == b"env":
+            st = uboot_env_store(fh, off, size - off)
+            if not st:
+                continue
+            found.append(["uboot-env", off, st[0]])
         else:
             e = "<" if magic == b"\x85\x19" else ">"
             hdr = read_at(fh, off, 12)
@@ -11340,7 +11892,23 @@ def flash_regions(fh, size):
         if reg[2] is None:
             nxt = next((r[1] for r in found[i + 1:] if r[1] > reg[1]), size)
             reg[2] = nxt - reg[1]
-    return [(f"flash @{off:#x} {kind}", off, ext) for kind, off, ext in found]
+    out = []
+    for kind, off, ext in found:                 # side-by-side JFFS2 partitions
+        pieces = jffs2_filesystems(fh, off, ext) if kind == "jffs2" else [(off, ext)]
+        out += [(f"flash @{o:#x} {kind}", o, n) for o, n in pieces]
+    return out
+
+
+def raw_flash_layout(fh, size):
+    """The flash_regions() of an image with no partition table, or [] when a
+    filesystem opens the image at offset 0 and holds it whole. An image that
+    opens with JFFS2 is split with jffs2_filesystems() too, since a dump of two
+    JFFS2 partitions side by side opens with the first of them."""
+    kind = identify_fs(fh, 0, size)[0]
+    if kind == "jffs2":
+        pieces = jffs2_filesystems(fh, 0, size)
+        return [(f"flash @{o:#x} jffs2", o, n) for o, n in pieces] if len(pieces) > 1 else []
+    return [] if kind else flash_regions(fh, size)
 
 
 def partition_regions(fh, size):
@@ -11394,7 +11962,7 @@ def partition_regions(fh, size):
             regions.append((f"GPT part {idx} {name[:20]}", first * ss, sz))
             names[first * ss] = volume_name(idx, first, name)
     if not regions:
-        flash = [] if identify_fs(fh, 0, size)[0] else flash_regions(fh, size)
+        flash = raw_flash_layout(fh, size)
         for label, base, rsize in flash:
             regions.append((label, base, rsize))
             names[base] = volume_name(None, base // SECTOR)
@@ -11685,7 +12253,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
         if not sized_regions:
             # With nothing recognised at offset 0 either, it may be a raw flash
             # dump: look for the filesystems inside it (flash_regions).
-            flash = [] if identify_fs(fh, 0, size)[0] else flash_regions(fh, size)
+            flash = raw_flash_layout(fh, size)
             if flash:
                 print(f"\n  FLASH    no partition table and nothing recognised at offset 0; "
                       f"{len(flash)} flash filesystem(s) found by their own headers")
@@ -11898,8 +12466,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     ents, dropped = apply_exclude(ents, exclude)
                     log = []
                     miss = missing_past_end(base, base + total)
-                    f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
-                                                            may_be_short=bool(miss))
+                    f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter)
                     if manifest is not None:
                         rsize = next((r[2] for r in sized_regions if r[1] == base), None)
                         manifest.append({
@@ -12013,8 +12580,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         ents, dropped = apply_exclude(ents, exclude)
                         log = []
                         miss = missing_past_end(b)
-                        f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
-                                                                may_be_short=bool(miss))
+                        f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter)
                         if manifest is not None:
                             _u = read_at(fh, b + EXT_SB_OFF, 1024)
                             manifest.append({
@@ -12044,7 +12610,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
 
                 if kind in ("fat32", "exfat", "ntfs", "f2fs", "hfs+", "hfsx", "apfs",
                             "etfs", "efs", "qnx4", "squashfs", "jffs2", "ubi",
-                            "ubifs", "yaffs1", "yaffs2") and wanted:
+                            "ubifs", "yaffs1", "yaffs2") + CFG_KINDS and wanted:
                     if do_list:
                         print(f"        CONTENTS  (depth {list_depth})")
                         try:
@@ -12061,8 +12627,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             ents, dropped = apply_exclude(ents, exclude)
                             log = []
                             miss = missing_past_end(b)
-                            f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
-                                                                    may_be_short=bool(miss))
+                            f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter)
                             if manifest is not None:
                                 manifest.append({
                                     "volume": vol, **image_rec,
@@ -12115,8 +12680,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 ents, dropped = apply_exclude(ents, exclude)
                                 log = []
                                 miss = missing_past_end(b)
-                                f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
-                                                                        may_be_short=bool(miss))
+                                f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter)
                                 if manifest is not None:
                                     manifest.append({
                                         "volume": vol, **image_rec,
@@ -16386,7 +16950,8 @@ def self_test():
         jf = [(f"jffs2-{c}", "jffs2", "jffs2.src.sha256", "jffs2.src.stat", "stat", "", ("dev",),
                f"JFFS2 {what}")
               for c, what in (("le-zlib", "little endian, zlib"), ("be-zlib", "big endian, zlib"),
-                              ("le-lzo", "lzo"), ("le-rtime", "rtime"), ("le-none", "uncompressed"),
+                              ("le-lzo", "lzo"), ("le-lzma", "OpenWrt lzma"),
+                              ("le-rtime", "rtime"), ("le-none", "uncompressed"),
                               ("le-sum", "with erase block summary nodes"))]
         ub = [("ubifs-lzo", "ubifs", "ubifs.src.sha256", "ubifs.src.stat", "stat", "", (),
                "UBIFS bare mkfs.ubifs image, lzo")]
@@ -16504,6 +17069,395 @@ def self_test():
                   + ")" + ("; " + "; ".join(ebad) if ebad else "")
                   + (f"; listed but not in {listing}: " + ", ".join(r["extra"][:3])
                      if r["extra"] else "") + broke)
+
+        # A JFFS2 LZMA node must decode to exactly the size it records: a stream
+        # cut short, or a node claiming one byte more or one byte less than its
+        # stream holds, is refused rather than read as a different file. The node is the first
+        # LZMA node OpenWrt's mkfs.jffs2 wrote into the fixture.
+        lz_fx = os.path.join(fx, "jffs2-le-lzma.img.gz")
+        if os.path.isfile(lz_fx):
+            with gzip.open(lz_fx, "rb") as gz:
+                lz_raw = gz.read()
+            lz_node, lz_i = None, 0
+            while lz_node is None and lz_i + 68 <= len(lz_raw):
+                lz_magic, lz_ntype, lz_tlen = struct.unpack_from("<HHI", lz_raw, lz_i)
+                if lz_magic != 0x1985 or lz_tlen < 12:
+                    lz_i += 4
+                    continue
+                if lz_ntype == 0xE002 and lz_raw[lz_i + 56] == 8:
+                    lz_csize, lz_dsize = struct.unpack_from("<II", lz_raw, lz_i + 48)
+                    lz_node = (lz_raw[lz_i + 68:lz_i + 68 + lz_csize], lz_dsize)
+                lz_i += (lz_tlen + 3) & ~3
+
+            def _refused(src, lz_dsize):
+                try:
+                    jffs2_decompress(8, src, lz_dsize)
+                except DecompressError:
+                    return True
+                return False
+            cond = (lz_node is not None and len(jffs2_decompress(8, *lz_node)) == lz_node[1]
+                    and _refused(lz_node[0][:len(lz_node[0]) // 2], lz_node[1])
+                    and _refused(lz_node[0], lz_node[1] + 1)
+                    and _refused(lz_node[0], lz_node[1] - 1))
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] a JFFS2 LZMA node decodes to exactly the "
+                  "size it records, and one cut short or claiming a byte more or less is refused")
+
+        def _sha_match(walker, hashes, prefix=""):
+            """{path: None if it matches, else what went wrong} for every file
+            in a sha256sum list, read through `walker`."""
+            import hashlib
+            got = {p_: (n_, sz_) for p_, n_, _m, sz_, _t, _r in walk_all(walker)}
+            ub_res = {}
+            with open(hashes, encoding="utf-8") as hf:
+                for line in hf:
+                    if not line.strip():
+                        continue
+                    digest, path = line.rstrip("\n").split("  ", 1)
+                    g = got.get(prefix + path)
+                    if g is None:
+                        ub_res[path] = "not listed"
+                        continue
+                    try:
+                        h = hashlib.sha256(b"".join(walker.read_file(*g))).hexdigest()
+                        ub_res[path] = None if h == digest else "different bytes"
+                    except Exception as exc:         # pylint: disable=broad-except
+                        ub_res[path] = str(exc)
+            return ub_res
+
+        # A raw NAND dump holds bits before the controller's ECC corrected them,
+        # so a node can fail its CRC by one flipped bit. Flipped here in the bare
+        # UBIFS fixture: one bit in a data node, one in the root index node, one
+        # in another data node's stored CRC, and one in each master node (read
+        # by scanning its LEB, the path the journal replay also takes). Each
+        # must read with the bit restored. A data node with two bits flipped
+        # must be refused with that reason, never read with a wrong bit "fixed",
+        # and one whose place reads as erased flash refused as erased.
+        ub_fx = os.path.join(fx, "ubifs-lzo.img.gz")
+        if os.path.isfile(ub_fx) and os.path.isfile(os.path.join(fx, "ubifs.src.sha256")):
+            with gzip.open(ub_fx, "rb") as gz:
+                ub_img = bytearray(gz.read())
+            ub_w0 = UbifsWalker(io.BytesIO(bytes(ub_img)), 0)
+            ub_lsz = ub_w0.leb_size
+            ub_by_size = sorted((lz_i for lz_i, ub_d in ub_w0.data.items() if 0 in ub_d),
+                             key=lambda lz_i: -len(ub_w0.data[lz_i]))
+            ub_a, ub_b, ub_c, ub_d = (ub_w0.data[lz_i][0] for lz_i in ub_by_size[:4])
+            ub_root = ub_w0.master["root"]
+            # mkfs.ubifs writes each master node at the start of LEB 1 and LEB 2
+            ub_masters = [(ub_ln, 0) for ub_ln in (1, 2)
+                          if struct.unpack_from("<I", ub_img, ub_ln * ub_lsz)[0] == UBIFS_MAGIC
+                          and ub_img[ub_ln * ub_lsz + 20] == UBIFS_MST_NODE]
+            ub_mid_a, ub_mid_c = 48 + (ub_a[2] - 48) // 2, 48 + (ub_c[2] - 48) // 2   # inside the data
+            ub_flips = [(ub_a[0], ub_a[1], ub_mid_a, 0x04), (ub_root[0], ub_root[1], 40, 0x10),
+                     (ub_b[0], ub_b[1], 5, 0x01), (ub_c[0], ub_c[1], ub_mid_c, 0x01),
+                     (ub_c[0], ub_c[1], ub_mid_c + 1, 0x80)]
+            ub_flips += [(ub_ln, ub_o, 60, 0x02) for ub_ln, ub_o in ub_masters]
+            for ub_ln, ub_o, ub_at, ub_x in ub_flips:
+                ub_img[ub_ln * ub_lsz + ub_o + ub_at] ^= ub_x
+            ub_img[ub_d[0] * ub_lsz + ub_d[1]:ub_d[0] * ub_lsz + ub_d[1] + 4] = b"\xff" * 4
+            try:
+                ub_w1 = UbifsWalker(io.BytesIO(bytes(ub_img)), 0)
+                ub_res = _sha_match(ub_w1, os.path.join(fx, "ubifs.src.sha256"))
+                ub_paths = {n_: p_ for p_, n_, *_x in walk_all(ub_w1)}
+                ub_path_c, ub_path_d = ub_paths.get(ub_by_size[2]), ub_paths.get(ub_by_size[3])
+                ub_bad = {p_: why for p_, why in ub_res.items() if why}
+                ub_repaired = ub_w1.bit_repairs
+                ub_broke = ""
+            except Exception as exc:                 # pylint: disable=broad-except
+                ub_res, ub_bad, ub_repaired, ub_broke = {}, {}, set(), f"; raised {exc}"
+                ub_path_c = ub_path_d = None
+            ub_want_rep = {(ub_a[0], ub_a[1]), (ub_root[0], ub_root[1]), (ub_b[0], ub_b[1]), ub_masters[0]}
+            cond = (len(ub_masters) == 2 and ub_res and None not in (ub_path_c, ub_path_d)
+                    and set(ub_bad) == {ub_path_c, ub_path_d}
+                    and "more than one flipped bit" in ub_bad.get(ub_path_c, "")
+                    and "is erased flash" in ub_bad.get(ub_path_d, "")
+                    and ub_repaired == ub_want_rep and not ub_broke)
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] UBIFS nodes one flipped bit off their CRC "
+                  f"(data, index, stored CRC, master) read with the bit restored: "
+                  f"{len(ub_res) - len(ub_bad)} of {len(ub_res)} files match, {len(ub_repaired)} nodes "
+                  f"repaired of {len(ub_want_rep)} expected; the node with two bits flipped is "
+                  f"refused ({ub_bad.get(ub_path_c, 'NOT REFUSED')}), and the erased one "
+                  f"({ub_bad.get(ub_path_d, 'NOT REFUSED')})" + ub_broke)
+
+        # A file whose read fails partway must not reach the zip. zipfile cannot
+        # take a member back once it is written, and until 1.53 a file on a volume
+        # not expected to be short was streamed straight in, so an error after the
+        # first block left a member holding only the bytes read so far under the
+        # file's real name. Here many_blocks.txt's block 1 is erased in the UBIFS
+        # fixture and the image is extracted the way --extract does it: that file
+        # must be absent, under its own name or any other, and counted as failed,
+        # and the zip must hold every other file, matching the source hashes, and
+        # the manifest, and nothing else.
+        pe_fx = os.path.join(fx, "ubifs-lzo.img.gz")
+        pe_src = os.path.join(fx, "ubifs.src.sha256")
+        if os.path.isfile(pe_fx) and os.path.isfile(pe_src):
+            import hashlib as _hl_pe          # pylint: disable=import-outside-toplevel
+            with gzip.open(pe_fx, "rb") as gz:
+                pe_img = bytearray(gz.read())
+            pe_w0 = UbifsWalker(io.BytesIO(bytes(pe_img)), 0)
+            pe_target = "dir/many_blocks.txt"
+            pe_ino = next((n_ for p_, n_, *_x in walk_all(pe_w0) if p_ == pe_target), None)
+            pe_blocks = pe_w0.data.get(pe_ino, {})
+            pe_detail = ""
+            pe_cond = pe_ino is not None and len(pe_blocks) >= 3 and 1 in pe_blocks
+            if pe_cond:
+                pe_ln, pe_of = pe_blocks[1][0], pe_blocks[1][1]
+                pe_at = pe_ln * pe_w0.leb_size + pe_of
+                pe_img[pe_at:pe_at + 4] = b"\xff" * 4
+                # Both files are removed again: CI keeps the *.img files this
+                # function leaves behind as fixtures for the executables, and
+                # counts them.
+                pe_path = os.path.join(d, "ubifs_block1_erased.img")
+                pe_zip = os.path.join(d, "ubifs_block1_erased.zip")
+                pe_man = []
+                pe_buf = io.StringIO()
+                pe_want = {}
+                pe_leaked, pe_ok, pe_bad = [], 0, 0
+                try:
+                    with open(pe_path, "wb") as pe_fh:
+                        pe_fh.write(bytes(pe_img))
+                    with zipfile.ZipFile(pe_zip, "w") as zf, contextlib.redirect_stdout(pe_buf):
+                        main(pe_path, extract=pe_zip, zf=zf, manifest=pe_man)
+                    with open(pe_src, encoding="utf-8") as pe_hf:
+                        for pe_line in pe_hf:
+                            if pe_line.strip():
+                                pe_dg, pe_p = pe_line.rstrip("\n").split("  ", 1)
+                                pe_want[pe_p] = pe_dg
+                    with zipfile.ZipFile(pe_zip) as pe_zr:
+                        pe_members = {i_.filename: i_ for i_ in pe_zr.infolist()}
+                        # anything but the other files and the manifest: the damaged
+                        # file under its own name, a marker, or a stray
+                        pe_leaked = sorted(set(pe_members) - {"volumes.json"}
+                                           - {f"lba0/{p_}" for p_ in pe_want if p_ != pe_target})
+                        for pe_p, pe_dg in pe_want.items():
+                            if pe_p == pe_target:
+                                continue
+                            pe_i = pe_members.get(f"lba0/{pe_p}")
+                            if (pe_i is not None and
+                                    _hl_pe.sha256(pe_zr.read(pe_i)).hexdigest() == pe_dg):
+                                pe_ok += 1
+                            else:
+                                pe_bad += 1
+                finally:
+                    for pe_rm in (pe_path, pe_zip):
+                        if os.path.exists(pe_rm):
+                            os.remove(pe_rm)
+                pe_entry = pe_man[0] if pe_man else {}
+                pe_cond = (not pe_leaked and pe_bad == 0 and pe_ok == len(pe_want) - 1
+                           and pe_entry.get("failed") == 1
+                           and f"could not extract lba0/{pe_target}" in pe_buf.getvalue()
+                           and "is erased flash" in pe_buf.getvalue())
+                pe_detail = (f"{pe_ok} of {len(pe_want) - 1} other files match their source hash, "
+                             f"{pe_entry.get('failed')} failed, other members: "
+                             f"{pe_leaked or 'none'}")
+            else:
+                pe_detail = f"{pe_target} not found with a block 1 in the fixture"
+            if not pe_cond:
+                ok = False
+            print(f"  [{'PASS' if pe_cond else 'FAIL'}] a file whose read fails partway is left "
+                  f"out of the zip, not stored with the bytes read so far ({pe_detail})")
+
+        # CRC32_ONE_BIT_MAX rests on the shortest weight-3 codeword of CRC-32
+        # (x^a + x^b + 1 divisible by 0x104C11DB7): found here, not assumed.
+        cw_pow, cw_seen, cw_len = 1, {1: 0}, None
+        for cw_i in range(1, 100_000):
+            cw_pow <<= 1
+            if cw_pow >> 32:
+                cw_pow ^= 0x104C11DB7
+            cw_a = cw_seen.get(cw_pow ^ 1)
+            if cw_a:
+                cw_len = cw_i + 1
+                break
+            cw_seen.setdefault(cw_pow, cw_i)
+        cond = cw_len == 91640 and CRC32_ONE_BIT_MAX * 8 + 32 < cw_len
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] the shortest weight-3 CRC-32 codeword is "
+              f"{cw_len} bits, so a one-bit repair of up to {CRC32_ONE_BIT_MAX:,} bytes cannot "
+              "mistake two flipped bits for one")
+
+        # UBI checks a copy's data CRC only against another copy of the same LEB;
+        # a LEB whose one copy on the flash is marked as a copy with a bad data
+        # CRC is still attached. Here that is the UBIFS superblock's LEB, so the
+        # volume opens only if it is.
+        un_fx = os.path.join(fx, "ubi-nor.img.gz")
+        if os.path.isfile(un_fx) and os.path.isfile(os.path.join(fx, "ubifs.src.sha256")):
+            with gzip.open(un_fx, "rb") as gz:
+                ub_img = bytearray(gz.read())
+            un_u0 = UbiWalker(io.BytesIO(bytes(ub_img)), 0, len(ub_img))
+            un_vol0 = next(v for v in un_u0.ubi.volumes if v["name"] == "rootfs_data")
+            un_peb = un_u0.ubi.map[(un_vol0["id"], 0)]["peb"]
+            ub_at = un_peb * un_u0.ubi.peb + un_u0.ubi.vid_off
+            un_hdr = bytearray(ub_img[ub_at:ub_at + 64])
+            un_hdr[6] = 1                                    # copy_flag
+            struct.pack_into(">I", un_hdr, 20, 4096)         # data_size
+            struct.pack_into(">I", un_hdr, 32, _ubi_crc(bytes(4096)) ^ 1)   # a data CRC that fails
+            struct.pack_into(">I", un_hdr, 60, _ubi_crc(bytes(un_hdr[:60])))
+            ub_img[ub_at:ub_at + 64] = un_hdr
+            un_u1 = UbiWalker(io.BytesIO(bytes(ub_img)), 0, len(ub_img))
+            ub_res = _sha_match(un_u1, os.path.join(fx, "ubifs.src.sha256"), "rootfs_data/")
+            un_lone = un_u1.ubi.stats["copy with a bad data CRC, the only copy, used"]
+            cond = bool(ub_res) and not any(ub_res.values()) and un_lone == 1
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] a UBI LEB whose only copy is marked as a "
+                  f"copy with a bad data CRC is still read, as the kernel attaches it: "
+                  f"{sum(1 for v in ub_res.values() if v is None)} of {len(ub_res)} files match "
+                  f"({un_lone} such LEB counted)")
+
+        # Two JFFS2 partitions side by side in a dump with no partition table:
+        # both number their inodes from 2, so read as one filesystem a name from
+        # one shows the other's file of the same number. mkfs.jffs2's image
+        # (padded to one 64 KiB erase block, as a partition is) then the
+        # kernel-written NOR image. Read as one region, some files must come out
+        # wrong (the fixture reaches the defect); split, each piece must match
+        # its own list, both for a dump opening with the first filesystem
+        # (raw_flash_layout) and for one behind a block of zeros (flash_regions).
+        # The erased blocks between the two hold no node, so the boundary may
+        # fall anywhere from the end of the first image to the second's first
+        # block that holds one.
+        js_a, js_b, js_n = (os.path.join(fx, f"{n}.img.gz")
+                            for n in ("jffs2-le-zlib", "jffs2-nor-history", "jffs2-nand-history"))
+        js_ha, js_hb, js_hn = (os.path.join(fx, n) for n in ("jffs2.src.sha256", "jffs2-nor.history.sha256",
+                                                             "jffs2-nand.history.sha256"))
+        if all(os.path.isfile(f) for f in (js_a, js_b, js_n, js_ha, js_hb, js_hn)):
+            with gzip.open(js_a, "rb") as gz:
+                js_first = gz.read()
+            with gzip.open(js_b, "rb") as gz:
+                js_second = gz.read()
+            js_first += b"\xff" * (-len(js_first) % 65536)
+            js_bw = Jffs2Walker(io.BytesIO(js_second), 0, len(js_second))
+            js_first_node = min([n["off"] for ns in js_bw.inodes.values() for n in ns]
+                                + [o for o, *_r in js_bw.dirent_nodes]
+                                + [o for o, *_r in js_bw.obsolete])
+            js_first_node -= js_first_node % 65536
+            js_merged = _sha_match(walker_for("jffs2", io.BytesIO(js_first + js_second), 0,
+                                              len(js_first) + len(js_second)), js_ha)
+            js_wrong = sum(1 for v in js_merged.values() if v)
+            # The NAND leg: mkfs.jffs2's image laid out as a raw NAND dump
+            # (2048-byte pages, 64 spare bytes, 64 pages an erase block), then the
+            # kernel-written NAND dump, whose offsets map back through the spare.
+            with gzip.open(js_n, "rb") as gz:
+                js_nand = gz.read()
+            js_pg, js_sp = 2048, 64
+            with gzip.open(js_a, "rb") as gz:
+                js_a2 = gz.read()
+            js_a2 += b"\xff" * (-len(js_a2) % (64 * js_pg))
+            js_first_nand = b"".join(js_a2[i:i + js_pg] + b"\xff" * js_sp
+                                     for i in range(0, len(js_a2), js_pg))
+            js_nw = Jffs2Walker(io.BytesIO(js_nand), 0, len(js_nand))
+            js_nfirst = min(n["off"] for ns in js_nw.inodes.values() for n in ns)
+            js_nfirst = (js_nfirst // js_pg) * (js_pg + js_sp)
+            js_results = []
+            for js_lead, js_one, js_two, js_limit, hashes in (
+                    (b"", js_first, js_second, js_first_node, (js_ha, js_hb)),
+                    (bytes(65536), js_first, js_second, js_first_node, (js_ha, js_hb)),
+                    (b"", js_first_nand, js_nand, js_nfirst, (js_ha, js_hn))):
+                js_img = js_lead + js_one + js_two
+                js_fh = io.BytesIO(js_img)
+                js_layout = raw_flash_layout(js_fh, len(js_img))
+                js_bases = [b for _l, b, _s in js_layout]
+                js_lo = len(js_lead) + len(js_one)
+                js_ok = (len(js_bases) == 2 and js_bases[0] == len(js_lead)
+                         and js_lo <= js_bases[1] <= js_lo + js_limit)
+                if js_ok:
+                    for (_l, b, s), hl in zip(js_layout, hashes):
+                        res = _sha_match(walker_for("jffs2", js_fh, b, s), hl)
+                        js_ok = js_ok and bool(res) and not any(res.values())
+                js_results.append((js_ok, js_bases))
+            cond = js_wrong > 0 and all(r[0] for r in js_results)
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] two JFFS2 partitions side by side are read "
+                  f"as two filesystems, each matching its own list (read as one, {js_wrong} "
+                  f"files come out wrong); split at "
+                  + " and ".join(str(r[1]) for r in js_results))
+
+        # Where conflicts alone allow more than one cut, the links decide. Three
+        # 4 KiB erase blocks written here from the node layouts cited above:
+        # block 0 holds root names a (inode 2) and c (inode 5) and inode 2's
+        # data, block 1 inode 5's data and nothing that conflicts with either
+        # side, block 2 another filesystem's root name b (inode 2, version 1)
+        # and its own inode 2. Only the link from c to inode 5 puts block 1 with
+        # block 0; cut after block 0 instead, c would lose its content.
+        def _jn(ntype, body):
+            head = struct.pack("<HHI", JFFS2_MAGIC, ntype, 12 + len(body))
+            node = head + struct.pack("<I", _kcrc32(head)) + body
+            return node + b"\xff" * (-len(node) % 4)
+
+        def _jdirent(pino, version, ino, name):
+            b = struct.pack("<IIIIBBH", pino, version, ino, 0, len(name), 8, 0)
+            head = struct.pack("<HHI", JFFS2_MAGIC, JFFS2_DIRENT, 40 + len(name))
+            head += struct.pack("<I", _kcrc32(head))
+            return _jn(JFFS2_DIRENT, b + struct.pack("<II", _kcrc32(head + b), _kcrc32(name))
+                       + name)
+
+        def _jinode(ino, version, data, mode=S_IFREG | 0o644, hole=0, isize=None):
+            dsize, compr = (hole, 1) if hole else (len(data), 0)     # 1: JFFS2_COMPR_ZERO
+            b = struct.pack("<IIIHHIIIIIIIBBH", ino, version, mode, 0, 0,
+                            dsize if isize is None else isize, 0, 0, 0, 0, len(data), dsize,
+                            compr, 0, 0)
+            head = struct.pack("<HHI", JFFS2_MAGIC, JFFS2_INODE, 68 + len(data))
+            head += struct.pack("<I", _kcrc32(head))
+            return _jn(JFFS2_INODE, b + struct.pack("<II", _kcrc32(data), _kcrc32(head + b))
+                       + data)
+
+        def _jblock(*nodes):
+            blk = _jn(JFFS2_CLEANMARKER, b"") + b"".join(nodes)
+            return blk + b"\xff" * (4096 - len(blk))
+        jl_img = (_jblock(_jdirent(1, 1, 2, b"a"), _jinode(2, 1, b"one"), _jdirent(1, 2, 5, b"c"))
+                  + _jblock(_jinode(5, 1, b"five"))
+                  + _jblock(_jdirent(1, 1, 2, b"b"), _jinode(2, 1, b"two")))
+        jl_fh = io.BytesIO(jl_img)
+        jl_layout = raw_flash_layout(jl_fh, len(jl_img))
+        jl_read = []
+        for _l, b, s in jl_layout:
+            jw = walker_for("jffs2", jl_fh, b, s)
+            jl_read.append({p: b"".join(jw.read_file(n, sz)) for p, n, _m, sz, _t, _r
+                            in walk_all(jw)})
+        cond = ([b for _l, b, _s in jl_layout] == [0, 8192]
+                and jl_read == [{"a": b"one", "c": b"five"}, {"b": b"two"}])
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] where conflicts allow more than one cut, the "
+              f"one that keeps names with their inodes is taken: pieces at "
+              f"{[b for _l, b, _s in jl_layout]}, holding {[sorted(r) for r in jl_read]}")
+
+        # A node the kernel marked obsolete still belongs to the filesystem that
+        # wrote it. Block 1 holds only an orphan inode (no name links it) and an
+        # obsolete node that conflicts with block 2's, so only that node puts
+        # block 1 with block 0.
+        def _obsolete(node):
+            return node[:2] + struct.pack("<H", JFFS2_INODE & ~JFFS2_ACCURATE) + node[4:]
+        jo_img = (_jblock(_jdirent(1, 1, 2, b"a"), _jinode(2, 1, b"one"))
+                  + _jblock(_obsolete(_jinode(2, 5, b"old")), _jinode(7, 1, b"orphan"))
+                  + _jblock(_jdirent(1, 1, 2, b"b"), _jinode(2, 5, b"two")))
+        jo_layout = raw_flash_layout(io.BytesIO(jo_img), len(jo_img))
+        cond = [b for _l, b, _s in jo_layout] == [0, 8192]
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] an obsolete node keeps its block with the "
+              f"filesystem that wrote it: pieces at {[b for _l, b, _s in jo_layout]}")
+
+        # And one filesystem is never cut: garbage collection rewrites a partly
+        # obsoleted hole with its own version and range but the mode bits of the
+        # moment (gc.c:1030-1098), so after a chmod two nodes share a version and
+        # differ in permission bits only.
+        jh_img = (_jblock(_jdirent(1, 1, 2, b"a"),
+                          _jinode(2, 1, b"", S_IFREG | 0o644, hole=8192),
+                          _jinode(2, 2, b"tail", S_IFREG | 0o644, isize=8192))
+                  + _jblock(_jinode(2, 1, b"", S_IFREG | 0o600, hole=8192, isize=8192),
+                            _jinode(2, 3, b"", S_IFREG | 0o600, isize=8192)))
+        jh_layout = raw_flash_layout(io.BytesIO(jh_img), len(jh_img))
+        cond = jh_layout == []
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] a filesystem whose rewritten hole differs "
+              f"from its first copy only in permission bits is left whole "
+              f"({len(jh_layout) or 1} piece(s))")
 
         # YAFFS writes wherever garbage collection freed a block, so a real
         # partition can open on blocks holding only data chunks, or only
@@ -16698,6 +17652,149 @@ def self_test():
                   f"not searched for more ("
                   + ", ".join(f"{v['label']} {v['kind']}" for v in wv) + ")")
 
+        # A flash chip carries configuration stores beside its filesystems: the
+        # U-Boot environment and, on Belkin WeMo devices, a libnvram store. Built
+        # here from made-up strings: random bytes, a single-copy environment
+        # (8 KiB) at 0x10000, a redundant-layout one (4 KiB, flags byte 3) at
+        # 0x14000, the JFFS2 fixture at 0x20000, a 32 KiB NVRM store straight
+        # after it, then erased flash. volumes() must find the four, end the
+        # JFFS2 where the store begins, read the JFFS2 whole, and hand back each
+        # store's bytes exactly. The controls: one flipped data byte in a store,
+        # a store whose strings never end, and a CRC over the wrong length each
+        # leave the store unclaimed; an environment that is the whole file is
+        # recognised as the whole image, and one that only begins a larger file
+        # is not, so that file's other regions are still searched.
+        if os.path.isfile(jff):
+            import binascii as _ba, io as _io, random as _rnd, gzip as _gz
+            jf_raw = _gz.open(jff, "rb").read()
+            padto = lambda b, a: b + b"\xff" * (-len(b) % a)
+
+            def _env(strings, size, hdr=4, flags=1, ended=True):
+                data = b"\x00".join(strings) + (b"\x00\x00" if ended else b"\x00")
+                data = data.ljust(size - hdr, b"\x00" if ended else b"x")
+                return (struct.pack("<I", _ba.crc32(data))
+                        + (bytes([flags]) if hdr == 5 else b"") + data)
+
+            def _nvrm(strings, size):
+                body = b"".join(s + b"\x00" for s in strings)
+                data = (body + b"\x00").ljust(size - NVRM_HEADER, b"\xff")
+                return (NVRM_MAGIC + struct.pack("<III", _ba.crc32(data), len(strings),
+                                                 NVRM_HEADER + len(body)) + data)
+
+            e1 = _env([b"bootdelay=1", b"baudrate=57600", b"ethaddr=00:11:22:33:44:55"], 0x2000)
+            e2 = _env([b"example_addr=192.0.2.1", b"example_mode=test"], 0x1000, hdr=5, flags=3)
+            nv = _nvrm([b"example_name=Test Plug", b"example_id=000TEST000",
+                        b"example_zone=1.0"], 0x8000)
+            jpad = padto(jf_raw, 65536)
+            nor = bytearray(_rnd.Random(11).randbytes(0x20000))
+            nor[0x10000:0x10000 + len(e1)] = e1
+            nor[0x14000:0x14000 + len(e2)] = e2
+            nor += jpad + nv
+            nor += b"\xff" * ((2 << 20) - len(nor))
+            nv_at = 0x20000 + len(jpad)
+            want = [(0x10000, "uboot-env", len(e1)), (0x14000, "uboot-env", len(e2)),
+                    (0x20000, "jffs2", len(jpad)), (nv_at, "nvram", len(nv))]
+            vols = volumes(_io.BytesIO(bytes(nor)), len(nor))
+            got = [(v["base"], v["kind"], v["size"]) for v in vols]
+            reads = {}
+            for v in vols:
+                w = v.get("walker")
+                if v["kind"] in CFG_KINDS and w:
+                    [(fname, node)] = w.listdir(w.root)
+                    reads[v["base"]] = (fname, b"".join(w.read_file(node, w.entry(node)[1])))
+            jentries = sum(1 for v in vols if v["kind"] == "jffs2" and v.get("walker")
+                           for _e in collect(v["walker"], v["walker"].root))
+            ccond = (got == want and jentries == 310 + 3
+                     and reads == {0x10000: ("uboot-env.bin", e1), 0x14000: ("uboot-env.bin", e2),
+                                   nv_at: ("nvram.bin", nv)}
+                     and uboot_env_store(_io.BytesIO(e2), 0, len(e2)) == (len(e2), 5, 3))
+            if not ccond:
+                ok = False
+            print(f"  [{'PASS' if ccond else 'FAIL'}] a flash dump's U-Boot environments and "
+                  f"libnvram store are found by their CRC-32, one of each layout, and each "
+                  f"read back byte for byte; the JFFS2 before the store ends where it begins "
+                  f"({', '.join(f'{k} {b:#x} {human(n)}' for b, k, n in got)}; "
+                  f"{jentries} JFFS2 entries)")
+
+            flipped = bytearray(nor)
+            flipped[0x10000 + 40] ^= 1                  # a data byte of the first environment
+            flipped[nv_at + NVRM_HEADER + 3] ^= 1        # a data byte of the store
+            unended = bytearray(nor)
+            unended[0x14000:0x14000 + len(e2)] = _env([b"example_addr=192.0.2.1"], 0x1000,
+                                                       hdr=5, ended=False)
+            short = bytearray(nor)                       # a CRC over less than the store
+            sd = bytes(e1[4:0x1000])
+            short[0x10000:0x10004] = struct.pack("<I", _ba.crc32(sd[:0x800]))
+            kinds = lambda img: [(v["base"], v["kind"]) for v in volumes(_io.BytesIO(bytes(img)),
+                                                                        len(img))]
+            nk = [kinds(flipped), kinds(unended), kinds(short)]
+            ncond = (not any(b == 0x10000 for b, _k in nk[0])
+                     and not any(k == "nvram" for _b, k in nk[0])
+                     and not any(b == 0x14000 for b, _k in nk[1])
+                     and not any(b == 0x10000 for b, _k in nk[2]))
+            if not ncond:
+                ok = False
+            print(f"  [{'PASS' if ncond else 'FAIL'}] and a store with one flipped data byte, "
+                  f"one whose strings never end, or one whose CRC covers a shorter length is "
+                  f"not claimed")
+
+            alone = kinds(e1)
+            leading = bytearray(e1) + _rnd.Random(12).randbytes(0x8000)
+            leading[0x6000:0x6000 + len(e2)] = e2
+            lead_kinds = kinds(leading)
+            wcond = (alone == [(0, "uboot-env")]
+                     and lead_kinds == [(0, "uboot-env"), (0x6000, "uboot-env")]
+                     and [v["label"] for v in volumes(_io.BytesIO(bytes(leading)), len(leading))]
+                     == ["flash @0x0 uboot-env", "flash @0x6000 uboot-env"])
+            if not wcond:
+                ok = False
+            print(f"  [{'PASS' if wcond else 'FAIL'}] and an environment that is the whole file "
+                  f"is that file ({alone}), while one that only begins a larger file leaves "
+                  f"the rest to be searched ({lead_kinds})")
+
+        # An eMMC image from an embedded device can hold ext filesystems with no
+        # partition table in front of them. Built here: 1.25 MiB of random bytes,
+        # then the ext4 fixture and the ext2 fixture at 4 KiB boundaries, then a
+        # whole copy of the ext4 fixture whose superblock names block group 1, as
+        # a backup copy does. The random bytes carry two more decoys: 64 random
+        # 4 KiB blocks with the ext magic set, and the ext4 fixture's first 4 KiB
+        # (an intact superblock) with nothing readable behind it. volumes() must
+        # find exactly the two filesystems, at those offsets, and read their
+        # files; no decoy may be claimed. The backup copy is what fails if the
+        # block group check is removed, the lone superblock if the root check is.
+        e4f, e2f = (os.path.join(fx, n) for n in ("ext4-sparse.img.gz", "ext2-sparse.img.gz"))
+        if os.path.isfile(e4f) and os.path.isfile(e2f):
+            import gzip as _gz, io as _io, random as _rnd
+            e4, e2 = _gz.open(e4f, "rb").read(), _gz.open(e2f, "rb").read()
+            rnd = _rnd.Random(11)
+            lead = bytearray(rnd.randbytes(0x140000))
+            m = EXT_SB_OFF + EXT_F["magic"]
+            for blk in range(0x40000, 0x80000, 0x1000):        # random, with the magic
+                lead[blk + m:blk + m + 2] = b"\x53\xef"
+            lead[0x100000:0x101000] = e4[:0x1000]               # a superblock and no more
+            lead[0x101000:0x140000] = bytes(0x3F000)
+            backup = bytearray(e4)
+            backup[EXT_SB_OFF + 0x5A:EXT_SB_OFF + 0x5C] = (1).to_bytes(2, "little")
+            e4_at = len(lead)
+            e2_at = e4_at + len(e4) + 0x3000
+            mmc = (bytes(lead) + e4 + b"\x00" * 0x3000 + e2 + b"\x00" * 0x1000
+                   + bytes(backup) + b"\x00" * 0x100000)
+            want_at = {e4_at: "ext4", e2_at: "ext2"}
+            vols = volumes(_io.BytesIO(mmc), len(mmc))
+            got_at = {v["base"]: v["kind"] for v in vols}
+            want_n = sum(len(collect(w, w.root)) for w in (ExtWalker(_io.BytesIO(e4), 0),
+                                                            ExtWalker(_io.BytesIO(e2), 0)))
+            got_n = sum(1 for v in vols if v.get("walker")
+                        for _e in collect(v["walker"], v["walker"].root))
+            mcond = got_at == want_at and got_n == want_n and want_n > 0
+            if not mcond:
+                ok = False
+            print(f"  [{'PASS' if mcond else 'FAIL'}] an eMMC image with no partition table has "
+                  f"its ext filesystems found by their superblocks at "
+                  + ", ".join(f"{k} {b:#x}" for b, k in sorted(got_at.items()))
+                  + f" ({got_n} of {want_n} files collected), and a backup superblock is "
+                  "not taken for one")
+
         # A chip-off NAND dump keeps each page's spare (OOB) bytes after it. UBI
         # and JFFS2 lay data across pages, so they are read with the spare
         # stripped (NandDataView). Two such dumps are built here from the
@@ -16739,10 +17836,12 @@ def self_test():
                 print(f"  [{'PASS' if ocond else 'FAIL'}] {label} in a raw NAND dump with its "
                       f"spare bytes: geometry found as {geo}, {okn} of {len(want)} files match")
 
-        # The controls. One byte of one file's stored bytes is flipped in each
-        # family's uncompressed image, and exactly that file must come back
-        # different: a content check that has never reported a difference says
-        # nothing. (In UBIFS the node's CRC catches it and the file is refused;
+        # The controls. Two bits of one byte of one file's stored bytes are
+        # flipped in each family's uncompressed image, and exactly that file must
+        # come back different: a content check that has never reported a
+        # difference says nothing. Two bits, because a UBIFS node one bit off
+        # its CRC is read with the bit restored. (In UBIFS the node's CRC catches
+        # it and the file is refused;
         # in JFFS2 the node is dropped as the kernel drops it, and a file whose
         # only node that was is no longer listed; YAFFS keeps no data CRC, so
         # the bytes differ.)
@@ -16756,7 +17855,7 @@ def self_test():
                 continue
             try:
                 r = _flash_fixture_check(img, os.path.join(fx, hashes), prefix=prefix,
-                                         corrupt=(b"deep file\n", 0x20))
+                                         corrupt=(b"deep file\n", 0x21))
                 got, want, miss, diff = r["files"]
             except Exception:                        # pylint: disable=broad-except
                 got, want, miss, diff = 0, 0, 0, 0
@@ -17602,7 +18701,8 @@ if __name__ == "__main__":
         prog="qnxprobe.py",
         description="Read QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, exFAT, NTFS, HFS+ and "
                     "APFS filesystems, the Linux flash filesystems SquashFS, JFFS2, "
-                    "UBI/UBIFS and YAFFS1/YAFFS2, and QNX IFS boot images, out of "
+                    "UBI/UBIFS and YAFFS1/YAFFS2, QNX IFS boot images, and the U-Boot "
+                    "environment and Belkin libnvram stores a flash chip carries, out of "
                     "raw disk images and flash dumps: identify each by its own "
                     "on-disk structure rather "
                     "than trusting a partition type byte, list, and extract to a "
