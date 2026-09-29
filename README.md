@@ -3,7 +3,7 @@
 <p align="center">
 <img src="https://github.com/stark4n6/Arc2Lite/blob/main/assets/Arc2Lite.png" width="300" height="300">
 </p>
-A simple script to read the contents of a zip/tar/gz archive or a forensic disk image and extract metadata to a SQLite DB.
+A simple script to read the contents of a zip/tar/gz/xz archive or a forensic disk image and extract metadata to a SQLite DB.
 
 ## Disk images and E01 acquisitions
 
@@ -19,7 +19,10 @@ python arc2lite.py -i C:\images -o C:\reports -r
 ```
 
 Nothing is extracted and no file's content is read. Only the directory trees
-are walked, and the image is never written to.
+are walked, and the image is never written to. The one exception is
+`-sig`/`--check-signatures`, which you opt into: it reads a small header from
+each file to check its type (see the 2026-09-27 update below), and still
+writes nothing to the image.
 
 An encrypted image (an encrypted Apple disk image, an encrypted AFF, or an
 acquisition FTK Imager encrypted with AD encryption) opens only with its password
@@ -91,26 +94,25 @@ segment. That is a different question from the hash of the acquired disk, and
 an E01 records its own MD5 and SHA-1 over the whole disk at acquisition time.
 Those are in `image_metadata.acquisition_md5` and `acquisition_sha1`.
 
-## UPDATE 2026-09-24:
+## UPDATE 2026-09-29:
 
-Bodyfile/timeline export, for loading Arc2Lite's results into mactime, Plaso, Timesketch or anything else that reads the Sleuth Kit body format.
+Signature/extension mismatch detection: flags a file whose extension doesn't match what its own bytes actually are (a `.jpg` that's really a renamed `.zip`, say) -- the kind of thing a hidden or relabeled file shows up as.
 
-- `-t/--timeline` on the command line, or the "Also export timeline (.body)" checkbox in the GUI, writes a <database name>.body file beside each archive's or image's own database, in addition to whatever -e/--export produces.
-- It reads straight from that database's file_listing, so it always reflects the same deduplicated rows the database (or its CSV) does, and it runs before -e/--export cleans that database up, so -t csv still gets a bodyfile even though the .db itself is removed afterward.
-- It's per archive/image, not for the run's Arc2Lite_Master_Log.db — a timeline is a property of one piece of evidence, and the master log doesn't have a file_listing of its own to draw one from.
-- Fields Arc2Lite doesn't track (MD5, inode, UID, GID, and change time) are written as 0; size, last-accessed, last-modified and created come straight from file_listing.
-- A FAT/exFAT "stored reading" (see "About the dates" above) is read as the literal digits it was written with, not converted through the host machine's timezone, so the same evidence produces the same bodyfile no matter where Arc2Lite runs.
+- `-sig`/`--check-signatures` on the command line, or the "Check file signatures" checkbox in the GUI, checks every file's header against a small built-in table of common types (images, documents, archives, executables, and a few more) and records anything that disagrees with the extension in a new `signature_mismatches` table -- `entry_path`, `file_extension`, `expected_type`, `detected_type`.
+- Works for archives and disk images alike. An extension the table has no expectation for is never flagged, so it catches real mismatches rather than guessing at every extension that exists.
+- It's opt-in. For an archive the cost is small, since reading a file's header is already how the archive library works. For a disk image it's real: each file needs a seek and a read on top of the metadata-only walk, so a large image takes measurably longer with `-sig` on. Whether that's worth it is the examiner's call, so it's off by default.
+- `signature_mismatches` exists in every database either way (empty when `-sig` isn't used, just as `image_deleted_files` is empty on a volume with nothing recovered), so it gets its own CSV automatically whenever `-e`/`--export` includes `csv`.
 
-## UPDATE 2026-09-18:
+## UPDATE 2026-09-25:
 
-CSV export option, requested by Andrew Rathbun via DFIR Discord (Issue #2).
+Bodyfile/timeline export and CSV export, both driven by one `-e`/`--export` switch.
 
-- `-e`/`--export` on the command line, or the SQLite/CSV/Both selector in the GUI, picks what a run leaves on disk: `sqlite` (the default, unchanged from before), `csv`, or `both`.
-- `csv` and `both` write every table in a database out as its own CSV file, in a `<database name>_csv` folder beside it, for each archive's own database as well as the run's `Arc2Lite_Master_Log.db`.
-- That means a `file_listing.csv` (plus `archive_metadata.csv`, and the `image_*` tables for a disk image) and a `processing_log.csv` come out alongside everything else.
-- `csv` then removes the `.db` files afterward, leaving only the CSVs; `both` keeps everything.
-- The database is still built the same way internally either way — that's what gives `file_listing`
-- its per-path dedup — `csv` just cleans it up once the CSVs are written instead of never building it.
+- `-e`/`--export` on the command line, or the SQLite/CSV/Timeline checkboxes in the GUI, picks one or more formats to leave on disk: `sqlite` (the default, unchanged from before), `csv`, and/or `timeline`. Combine them freely, e.g. `-e sqlite csv timeline`, or `-e csv timeline` with no database kept at all.
+- `csv` writes every table in a database out as its own CSV file, in a `<database name>_csv` folder beside it, for each archive's own database as well as the run's `Arc2Lite_Master_Log.db` -- a `file_listing.csv` (plus `archive_metadata.csv`, and the `image_*` tables for a disk image) and a `processing_log.csv`.
+- `timeline` writes a `<database name>.body` file -- a Sleuth Kit/mactime bodyfile, for loading into `mactime`, Plaso, Timesketch or anything else that reads that format -- beside each archive's or image's own database. It's scoped to per-archive/image databases only: the run's `Arc2Lite_Master_Log.db` has no `file_listing` of its own to draw a timeline from, so it never gets a `.body`, no matter which formats are chosen. Fields Arc2Lite doesn't track (MD5, inode, UID, GID, and change time) are written as `0`. A FAT/exFAT "stored reading" (see "About the dates" above) is read as the literal digits it was written with, not converted through the host machine's timezone, so the same evidence produces the same bodyfile no matter where Arc2Lite runs.
+- `sqlite` keeps the `.db` file; leaving it out of the choices removes the `.db` afterward, once whatever other formats were chosen have been written from it. The database is always built internally regardless of choice -- that's what gives `file_listing` its per-path dedup -- `csv` and `timeline` just read from it and then it's cleaned up if `sqlite` wasn't kept.
+
+Requested by Andrew Rathbun via DFIR Discord (Issue #2).
 
 ## UPDATE 2026-03-18:
 GUI and CLI have been combined into one script. If no switches are supplied it will run the GUI.
@@ -136,21 +138,30 @@ With v0.0.4 this now handles ZIP and TAR and folder paths, so the script has bee
 ## Command Line Switches
 ```
 usage: arc2lite.py [-h] -i INPUT -o OUTPUT [-r] [-ha {md5,sha1,sha256}]
+                   [-e {sqlite,csv,timeline} [{sqlite,csv,timeline} ...]]
+                   [-sig]
 
 options:
-   -e, --export {sqlite,csv,both}
-                        Export format for the results: 'sqlite' (default),
-                        'csv', or 'both'
   -h, --help            show this help message and exit
-  -i, --input INPUT     ZIP/TAR/GZ archive, raw disk image, .E01 acquisition,
-                        or a folder of them
+  -i, --input INPUT     ZIP/TAR/GZ/XZ archive, raw disk image, .E01
+                        acquisition, or a folder of them
   -o, --output OUTPUT   Path for the export report
   -r, --recursive       Recursively scan folder for archives
   -ha, --hash {md5,sha1,sha256}
                         Optional hashing options
-  -t, --timeline        Also write a Sleuth Kit/mactime bodyfile (.body) for
-                        each archive or image processed (not for the master
-                        log)
+  -e, --export {sqlite,csv,timeline} [{sqlite,csv,timeline} ...]
+                        One or more export formats for the results: 'sqlite'
+                        (default), 'csv', and/or 'timeline' (a Sleuth
+                        Kit/mactime bodyfile). Combine as needed, e.g.
+                        -e sqlite csv timeline. 'timeline' only ever applies
+                        to an archive's or image's own database, never the
+                        master log.
+  -sig, --check-signatures
+                        Flag files whose extension doesn't match their
+                        actual file type (e.g. a .jpg that's really a
+                        renamed .zip). Reads a small header from every file,
+                        including within disk images, so it costs real time
+                        on a large input -- opt in with this flag.
 ```
 
 ## Tests
@@ -159,7 +170,12 @@ options:
 python -m unittest discover -s tests -v
 ```
 
-Nineteen tests covering the image path, with small filesystems built for the
-purpose in `tests/fixtures`. Run on Python 3.9, 3.10, 3.12 and 3.14. One of
-them stands the vendored reader beside those fixtures and runs its own
-self-test, so a bad re-vendor fails here rather than quietly later.
+Twenty-five tests covering the image path, with small filesystems built for the
+purpose in `tests/fixtures`; twelve covering apply_export_choice() and the
+CSV writer; thirteen covering the bodyfile writer and its date parsing;
+nine covering -e/--export end to end, across every combination of
+sqlite/csv/timeline; and seventeen covering signature/extension mismatch
+detection, in archives, in disk images, and in isolation. Run on Python 3.9,
+3.10, 3.12 and 3.14. One of the image-path tests stands the vendored reader
+beside those fixtures and runs its own self-test, so a bad re-vendor fails
+here rather than quietly later.
