@@ -158,6 +158,8 @@ class WalkAgreesWithTheReader(unittest.TestCase):
         self.assertIn("the cloud placeholders Windows would not read are refused",
                       r.stdout)
         self.assertIn("(3 of 3 refused, 3 placeholders)", r.stdout)
+        self.assertIn("[PASS] an NTFS-compressed file with a unit that stops at a zero "
+                      "chunk header reads at its full length", r.stdout)
         self.assertNotIn("[FAIL]", r.stdout)
 
     def test_a_volume_windows_wrote_lists_every_file_at_the_length_windows_gave(self):
