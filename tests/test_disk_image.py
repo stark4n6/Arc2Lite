@@ -34,12 +34,15 @@ FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 #   fat32  a zone-less wall-clock reading, and deleted directory entries
 #   exfat  the same, plus a deleted file inside a deleted directory
 #   ext4   an instant for modified and nothing for created or accessed
+#   ntfs-windows  a volume Windows 11 wrote: sparse files, NTFS compression,
+#          overlay (WOF) compression and cloud placeholders, beside
+#          ntfs-windows.known.tsv, which is what Windows reported for each file
 #
 # The .sha256 files beside them are the listings the vendored reader's own
 # self-test compares its walk against, and they are here so that check runs
 # rather than skipping when this repository's copy of the reader is tested.
 RAW_FIXTURES = ("ntfs-fixture", "apfs-fixture", "fat32-deleted", "exfat-deleted",
-                "ext4-sparse")
+                "ext4-sparse", "ntfs-windows")
 E01_FIXTURE = "encase6-fast.E01"
 
 
@@ -151,7 +154,35 @@ class WalkAgreesWithTheReader(unittest.TestCase):
         self.assertIsNotNone(got, r.stdout[-3000:])
         self.assertGreater(int(got.group(1)), 0)
         self.assertEqual(int(got.group(2)), 0)
+        # and the ones that need the volume Windows wrote
+        self.assertIn("the cloud placeholders Windows would not read are refused",
+                      r.stdout)
+        self.assertIn("(3 of 3 refused, 3 placeholders)", r.stdout)
         self.assertNotIn("[FAIL]", r.stdout)
+
+    def test_a_volume_windows_wrote_lists_every_file_at_the_length_windows_gave(self):
+        """Sparse files, compressed files and a cloud provider's online-only
+        placeholders are all listed, each at the length Windows reported. A
+        placeholder's content is not in the image, and its row is still there:
+        the listing says the file existed, with its size and dates."""
+        known = {}
+        with open(os.path.join(FIXTURES, "ntfs-windows.known.tsv"),
+                  encoding="utf-8", newline="") as fh:
+            for line in fh:
+                if line.startswith("#") or not line.strip():
+                    continue
+                path, length, _attrs, _on_disk, _sha, windows = line.rstrip("\n").split("\t")
+                known[path] = (int(length), windows)
+        self.assertEqual(len(known), 35)
+        refused = {p for p, (_n, windows) in known.items() if windows == "refused"}
+        self.assertEqual(len(refused), 3)
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _index(tmp, _stage(tmp, "ntfs-windows"))
+            listed = {path.split("/", 1)[1]: size for path, size in db.execute(
+                "SELECT entry_path, size FROM file_listing WHERE is_file = 1")}
+            db.close()
+        self.assertEqual({p: listed.get(p) for p in known},
+                         {p: length for p, (length, _w) in known.items()})
 
     def test_directories_are_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
