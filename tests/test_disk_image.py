@@ -34,6 +34,12 @@ FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 #   fat32  a zone-less wall-clock reading, and deleted directory entries
 #   exfat  the same, plus a deleted file inside a deleted directory
 #   ext4   an instant for modified and nothing for created or accessed
+#   fat16, fat12  FAT with a 16-bit and a 12-bit table and a fixed root, as macOS
+#          wrote them
+#   tfat16 the layout of Windows CE's transaction-safe FAT: 2,048-byte sectors,
+#          the TFAT16 type string, and every file under one root folder. macOS
+#          wrote it and qnxprobe's builder set the boot sector, so it stands in
+#          for the layout, not for Windows CE's driver
 #   ntfs-windows  a volume Windows 11 wrote: sparse files, NTFS compression,
 #          overlay (WOF) compression and cloud placeholders, beside
 #          ntfs-windows.known.tsv, which is what Windows reported for each file
@@ -42,7 +48,8 @@ FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 # self-test compares its walk against, and they are here so that check runs
 # rather than skipping when this repository's copy of the reader is tested.
 RAW_FIXTURES = ("ntfs-fixture", "apfs-fixture", "fat32-deleted", "exfat-deleted",
-                "ext4-sparse", "ntfs-windows")
+                "ext4-sparse", "ntfs-windows", "fat16-fixture", "tfat16-fixture",
+                "fat12-fixture")
 E01_FIXTURE = "encase6-fast.E01"
 
 
@@ -160,6 +167,13 @@ class WalkAgreesWithTheReader(unittest.TestCase):
         self.assertIn("(3 of 3 refused, 3 placeholders)", r.stdout)
         self.assertIn("[PASS] an NTFS-compressed file with a unit that stops at a zero "
                       "chunk header reads at its full length", r.stdout)
+        # and the ones that need the FAT16 and FAT12 volumes
+        self.assertIn("[PASS] every file of the FAT16 volume a driver wrote reads back",
+                      r.stdout)
+        self.assertIn("[PASS] every file of the TFAT16 volume a driver wrote reads back",
+                      r.stdout)
+        self.assertIn("[PASS] every file of the FAT12 volume a driver wrote reads back",
+                      r.stdout)
         self.assertNotIn("[FAIL]", r.stdout)
 
     def test_a_volume_windows_wrote_lists_every_file_at_the_length_windows_gave(self):

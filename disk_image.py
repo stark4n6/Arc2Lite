@@ -25,7 +25,7 @@ volume inside an image is listed in image_volumes with the reader's note on why
 it was not read.
 
 Filesystems qnxprobe walks: QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32,
-exFAT, NTFS, HFS+, APFS, the Linux flash filesystems SquashFS, JFFS2,
+FAT16, FAT12, exFAT, NTFS, HFS+, APFS, the Linux flash filesystems SquashFS, JFFS2,
 UBI/UBIFS and YAFFS1/YAFFS2, and QNX IFS boot images.
 
 Where the rows go
@@ -47,7 +47,7 @@ Four tables are added beside it, and nothing already there is changed:
                         node, what its dates mean, and the dates as the
                         filesystem stored them.
 ``image_deleted_files`` deleted directory entries that still name a file, from
-                        the filesystems that keep them (NTFS, FAT32, exFAT).
+                        the filesystems that keep them (NTFS, FAT32, FAT16, FAT12, exFAT).
 
 Dates
 -----
@@ -62,7 +62,7 @@ which a row carries:
 ``utc``             the filesystem stores an instant, counted from a fixed
                     epoch, and it is rendered as ISO 8601 in UTC. NTFS, ext,
                     F2FS, HFS+, APFS, QNX and the rest.
-``stored reading``  FAT32 and exFAT store a wall-clock reading and no zone.
+``stored reading``  FAT32, FAT16, FAT12 and exFAT store a wall-clock reading and no zone.
                     The writer converted it with whatever offset it held at
                     the time of writing, which the volume does not record, so
                     there is no correct conversion to UTC. The reading is
@@ -124,8 +124,8 @@ def _maybe_an_image_name(lowered):
     _stem, dot, suffix = lowered.rpartition(".")
     return bool(dot and suffix.isascii() and suffix.isdigit())
 
-FILESYSTEMS = ("QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, exFAT, NTFS, "
-               "HFS+, APFS, QNX IFS")
+FILESYSTEMS = ("QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, FAT16, FAT12, exFAT, "
+               "NTFS, HFS+, APFS, QNX IFS")
 
 READER = f"qnxprobe {qnxprobe.QNXPROBE_VERSION} / ewfprobe {ewfprobe.__version__}"
 
