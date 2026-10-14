@@ -504,5 +504,51 @@ class DeletedEntries(unittest.TestCase):
             db.close()
 
 
+
+class LogicalVolumes(unittest.TestCase):
+    """The LVM2 fixture qnxprobe's own tests use (written by lvm2 in an Ubuntu
+    VM; tools/make_lvm_fixtures.sh there): logical volumes that are one run of
+    extents, split into runs, striped, and RAID1, on two physical volumes."""
+
+    def test_every_file_lvm_wrote_is_listed_under_its_logical_volume(self):
+        want = set()
+        with open(os.path.join(FIXTURES, "lvm-fixture.sha256"), encoding="utf-8") as f:
+            for line in f:
+                lv, rel = line.rstrip("\n").split("  ", 1)[1].split("/", 1)
+                want.add((f"LVM fixvg/{lv}", rel))
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _index(tmp, _stage(tmp, "lvm-fixture"))
+            got = set(db.execute(
+                "SELECT v.partition_label, substr(f.entry_path, length(v.volume_name) + 2) "
+                "FROM file_listing f JOIN image_volumes v "
+                "ON f.entry_path LIKE v.volume_name || '/%' WHERE f.is_file = 1"))
+            db.close()
+        self.assertEqual(got, want)
+
+    def test_a_volume_read_through_a_map_has_no_offset_and_names_its_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _index(tmp, _stage(tmp, "lvm-fixture"))
+            rows = {r[0]: r[1:] for r in db.execute(
+                "SELECT partition_label, lba, byte_offset, walked, detail FROM image_volumes "
+                "WHERE partition_label IN ('LVM fixvg/data', 'LVM fixvg/striped', 'LVM fixvg/root')")}
+            db.close()
+        for label in ("LVM fixvg/data", "LVM fixvg/striped"):
+            lba, offset, walked, detail = rows[label]
+            self.assertEqual((lba, offset, walked), (None, None, 1), label)
+            self.assertIn("runs: [", detail, label)
+        lba, offset, walked, detail = rows["LVM fixvg/root"]
+        self.assertEqual((lba, offset, walked), (4096, 4096 * 512, 1))
+        self.assertNotIn("runs:", detail)
+
+    def test_a_luks_container_is_listed_as_not_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _index(tmp, _stage(tmp, "luks1-cbc"))
+            rows = db.execute("SELECT filesystem, walked, note FROM image_volumes").fetchall()
+            entries = db.execute("SELECT count(*) FROM image_entries").fetchone()[0]
+            db.close()
+        self.assertEqual([(r[0], r[1]) for r in rows], [("luks", 0)])
+        self.assertIn("LUKS-encrypted and not read", rows[0][2])
+        self.assertEqual(entries, 0)
+
 if __name__ == "__main__":
     unittest.main()
