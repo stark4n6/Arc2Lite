@@ -566,10 +566,19 @@ def index_image(file_path, cursor, image_type, update):
             basis, counts = "", {"file": 0, "dir": 0, "other": 0, "dropped": 0}
             deleted = 0
             note = vol.get("note", "") or ""
+            # A logical volume read through a map (split into runs, or striped)
+            # has no single place in the image: qnxprobe gives it no LBA, its
+            # base is only a placeholder, and the map says where each run is.
+            lmap = vol.get("lvm_map")
+            mapped = vol["lba"] is None and lmap is not None
+            where = "read through a map of its runs" if mapped else f"at LBA {vol['lba']:,}"
+            detail = vol.get("detail", "") or ""
+            if mapped:
+                detail = (detail + "; " if detail else "") + "runs: " + json.dumps(lmap.describe())
             if walker is None:
                 update(f"    [{vol['name'] or vol['label']}] {vol['kind']}: {note or 'not walked'}\n")
             else:
-                update(f"    [{vol['name']}] {vol['kind']} at LBA {vol['lba']:,}\n")
+                update(f"    [{vol['name']}] {vol['kind']} {where}\n")
                 try:
                     counts, dir_paths, basis = _index_volume(cursor, vol, update)
                     deleted = _index_deleted(cursor, vol, dir_paths, update)
@@ -583,7 +592,7 @@ def index_image(file_path, cursor, image_type, update):
             totals["deleted"] += deleted
             cursor.execute("INSERT OR REPLACE INTO image_volumes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (vol["name"] or vol["label"], vol["label"], vol["lba"],
-                            vol["base"], vol["size"], vol["kind"], vol.get("detail", ""),
+                            None if mapped else vol["base"], vol["size"], vol["kind"], detail,
                             vol.get("missing_past_end", 0), 1 if walker is not None else 0,
                             basis, counts["file"], counts["dir"], counts["other"],
                             deleted, counts["dropped"], note))

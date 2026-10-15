@@ -27,7 +27,8 @@ or with the private key of a certificate it is sealed to, and Arc2Lite takes
 neither. Under a name Arc2Lite reads as an image (`.E01`, a raw image name, or
 the first file of a numbered set) it is still listed: `image_metadata` gets a row
 whose note says it was not read. A BitLocker volume inside an image is listed in
-`image_volumes` with a note saying why it was not read.
+`image_volumes` with a note saying why it was not read, and so is a LUKS container:
+Arc2Lite takes no passphrase.
 
 | acquisition | entries | time |
 | --- | ---: | ---: |
@@ -43,6 +44,12 @@ directory tree, and the rows it produces are identical.
 Filesystems read: QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, FAT16, FAT12,
 exFAT, NTFS, HFS+, APFS, and QNX IFS boot images. Each volume is identified by its own
 on-disk structure rather than by a partition type byte.
+
+The logical volumes of an LVM2 physical volume are listed as volumes of their own,
+named `lvm_lba<first sector>_<group>_<volume>`. One split into runs or striped is read
+through a map of its runs and has no single place in the image, so its `lba` and
+`byte_offset` are empty and its `detail` lists each run's image offset. A RAID1 or
+mirror one is read from its first copy that is all in the image.
 
 Two files do the reading, both vendored in `vendor/` and both pure standard
 library, so this adds nothing to install:
