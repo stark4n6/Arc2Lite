@@ -1,16 +1,17 @@
-"""Tests for the export format switch (-e/--export {sqlite,csv,both}, and
-the GUI's matching SQLite/CSV/Both selector), and the CSV writer underneath
-it, export_tables_to_csv().
+"""Tests for apply_export_choice() -- what -e/--export (and the GUI's
+matching SQLite/CSV/Timeline checkboxes) calls per database -- and the CSV
+writer underneath it, export_tables_to_csv().
+
+See tests/test_export_switch.py for -e/--export exercised end to end
+through run_cli(), and tests/test_timeline.py for the bodyfile writer
+apply_export_choice() calls when 'timeline' is chosen.
 
 Run from the repository root:
 
     python3 -m unittest discover -s tests -v
 """
 
-import argparse
-import contextlib
 import csv
-import io
 import os
 import sqlite3
 import sys
@@ -61,8 +62,12 @@ class ExportsEveryTableToItsOwnCsv(unittest.TestCase):
             csv_dir = os.path.join(tmp, "1-evidence.zip_file_listing_csv")
             self.assertEqual(
                 sorted(written),
+                # signature_mismatches is always in setup_db()'s schema (see
+                # check_signature()), so it always gets its own CSV here too,
+                # empty or not -- the same way archive_metadata's CSV exists
+                # whether or not a hash was ever requested.
                 sorted(os.path.join(csv_dir, f) for f in
-                       ("archive_metadata.csv", "file_listing.csv")))
+                       ("archive_metadata.csv", "file_listing.csv", "signature_mismatches.csv")))
             for path in written:
                 self.assertTrue(os.path.isfile(path))
 
@@ -114,120 +119,97 @@ class ExportsEveryTableToItsOwnCsv(unittest.TestCase):
 
 class AppliesTheExportChoiceToOneDatabase(unittest.TestCase):
     """apply_export_choice() is what -e/--export (and the GUI's SQLite/CSV/
-    Both selector) actually calls per database. 'csv' has to build the .db
-    first and remove it afterward rather than skip it, because file_listing's
-    INSERT OR IGNORE dedup (see test_disk_image.WalkAgreesWithTheReader) only
-    happens through the database."""
+    Timeline checkboxes) actually calls per database, with export as a
+    collection of one or more of 'sqlite', 'csv', 'timeline'. Anything other
+    than 'sqlite' alone has to build the .db first and remove it afterward
+    rather than skip it, because file_listing's INSERT OR IGNORE dedup (see
+    test_disk_image.WalkAgreesWithTheReader) only happens through the
+    database."""
 
-    def test_sqlite_leaves_the_database_untouched_and_writes_no_csv(self):
+    def test_sqlite_leaves_the_database_untouched_and_writes_nothing_else(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = os.path.join(tmp, "listing.db")
             _build_db(db_path)
 
-            arc2lite.apply_export_choice(db_path, "sqlite")
+            arc2lite.apply_export_choice(db_path, ["sqlite"])
 
             self.assertTrue(os.path.isfile(db_path))
             self.assertFalse(os.path.isdir(os.path.join(tmp, "listing_csv")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "listing.body")))
 
     def test_csv_writes_csvs_then_removes_the_database(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = os.path.join(tmp, "listing.db")
             _build_db(db_path)
 
-            arc2lite.apply_export_choice(db_path, "csv")
+            arc2lite.apply_export_choice(db_path, ["csv"])
 
             self.assertFalse(os.path.exists(db_path))
             csv_dir = os.path.join(tmp, "listing_csv")
             self.assertTrue(os.path.isfile(os.path.join(csv_dir, "file_listing.csv")))
             self.assertTrue(os.path.isfile(os.path.join(csv_dir, "archive_metadata.csv")))
 
-    def test_both_keeps_the_database_and_writes_csvs(self):
+    def test_sqlite_and_csv_keeps_the_database_and_writes_csvs(self):
+        # The old boolean flag's "both" -- now just two choices together.
         with tempfile.TemporaryDirectory() as tmp:
             db_path = os.path.join(tmp, "listing.db")
             _build_db(db_path)
 
-            arc2lite.apply_export_choice(db_path, "both")
+            arc2lite.apply_export_choice(db_path, ["sqlite", "csv"])
 
             self.assertTrue(os.path.isfile(db_path))
             csv_dir = os.path.join(tmp, "listing_csv")
             self.assertTrue(os.path.isfile(os.path.join(csv_dir, "file_listing.csv")))
             self.assertTrue(os.path.isfile(os.path.join(csv_dir, "archive_metadata.csv")))
 
-
-def _run_cli_quietly(**overrides):
-    """run_cli() prints its progress to stdout; every test below only cares
-    about what ends up on disk, so its output is captured and discarded."""
-    args = argparse.Namespace(input=None, output=None, recursive=False, hash=None, export="sqlite")
-    for k, v in overrides.items():
-        setattr(args, k, v)
-    with contextlib.redirect_stdout(io.StringIO()):
-        arc2lite.run_cli(args)
-
-
-class TheExportSwitchEndToEnd(unittest.TestCase):
-    """-e/--export as a user on the command line actually sees it: one zip
-    in, run_cli() end to end, check what landed in the output folder."""
-
-    def _sample_zip(self, tmp):
-        zip_path = os.path.join(tmp, "sample.zip")
-        # get_forensic_type() ignores anything under 512 bytes (too small to
-        # be worth sniffing), so this needs real bulk, not just a valid zip.
-        with zipfile.ZipFile(zip_path, "w") as zf:
-            zf.writestr("hello.txt", "hi there " * 100)
-        return zip_path
-
-    def _out_root(self, out_dir):
-        # run_cli() names the run folder itself (Arc2Lite_Out_<timestamp>);
-        # there's exactly one and it was just created, so take it as given.
-        return os.path.join(out_dir, os.listdir(out_dir)[0])
-
-    def test_sqlite_is_the_default_and_produces_no_csv_anywhere(self):
+    def test_timeline_writes_a_bodyfile_then_removes_the_database(self):
         with tempfile.TemporaryDirectory() as tmp:
-            zip_path = self._sample_zip(tmp)
-            out_dir = os.path.join(tmp, "out")
-            os.makedirs(out_dir)
+            db_path = os.path.join(tmp, "listing.db")
+            _build_db(db_path)
 
-            _run_cli_quietly(input=zip_path, output=out_dir)
+            arc2lite.apply_export_choice(db_path, ["timeline"])
 
-            out_root = self._out_root(out_dir)
-            produced = os.listdir(out_root)
-            self.assertTrue(any(f.endswith(".db") for f in produced))
-            self.assertFalse(any(f.endswith("_csv") for f in produced))
+            self.assertFalse(os.path.exists(db_path))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "listing.body")))
+            self.assertFalse(os.path.isdir(os.path.join(tmp, "listing_csv")))
 
-    def test_csv_leaves_only_csvs_for_both_the_archive_and_the_master_log(self):
+    def test_every_choice_together_keeps_the_database_and_writes_both(self):
         with tempfile.TemporaryDirectory() as tmp:
-            zip_path = self._sample_zip(tmp)
-            out_dir = os.path.join(tmp, "out")
-            os.makedirs(out_dir)
+            db_path = os.path.join(tmp, "listing.db")
+            _build_db(db_path)
 
-            _run_cli_quietly(input=zip_path, output=out_dir, export="csv")
+            arc2lite.apply_export_choice(db_path, ["sqlite", "csv", "timeline"])
 
-            out_root = self._out_root(out_dir)
-            produced = os.listdir(out_root)
-            self.assertFalse(any(f.endswith(".db") for f in produced),
-                              f"a .db file survived csv-only mode: {produced}")
-            self.assertIn("Arc2Lite_Master_Log_csv", produced)
-            self.assertTrue(os.path.isfile(
-                os.path.join(out_root, "Arc2Lite_Master_Log_csv", "processing_log.csv")))
-            archive_csv_dirs = [f for f in produced if f.endswith("_file_listing_csv")]
-            self.assertEqual(len(archive_csv_dirs), 1)
-            self.assertTrue(os.path.isfile(
-                os.path.join(out_root, archive_csv_dirs[0], "file_listing.csv")))
+            self.assertTrue(os.path.isfile(db_path))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "listing.body")))
+            csv_dir = os.path.join(tmp, "listing_csv")
+            self.assertTrue(os.path.isfile(os.path.join(csv_dir, "file_listing.csv")))
 
-    def test_both_keeps_every_database_alongside_its_csvs(self):
+    def test_csv_and_timeline_without_sqlite_still_removes_the_database(self):
         with tempfile.TemporaryDirectory() as tmp:
-            zip_path = self._sample_zip(tmp)
-            out_dir = os.path.join(tmp, "out")
-            os.makedirs(out_dir)
+            db_path = os.path.join(tmp, "listing.db")
+            _build_db(db_path)
 
-            _run_cli_quietly(input=zip_path, output=out_dir, export="both")
+            arc2lite.apply_export_choice(db_path, ["csv", "timeline"])
 
-            out_root = self._out_root(out_dir)
-            produced = os.listdir(out_root)
-            self.assertTrue(any(f.endswith(".db") for f in produced))
-            self.assertTrue(any(f.endswith("_csv") for f in produced))
-            self.assertIn("Arc2Lite_Master_Log.db", produced)
-            self.assertIn("Arc2Lite_Master_Log_csv", produced)
+            self.assertFalse(os.path.exists(db_path))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "listing.body")))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "listing_csv", "file_listing.csv")))
+
+    def test_an_empty_or_missing_choice_defaults_to_sqlite(self):
+        # run_cli()'s own argparse won't allow an empty -e/--export (nargs="+"
+        # requires at least one value), but apply_export_choice() is called
+        # directly by the GUI too, so it defends against an empty list or
+        # None the same way the CLI's default already does.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "listing.db")
+            _build_db(db_path)
+
+            arc2lite.apply_export_choice(db_path, [])
+
+            self.assertTrue(os.path.isfile(db_path))
+            self.assertFalse(os.path.isdir(os.path.join(tmp, "listing_csv")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "listing.body")))
 
 
 if __name__ == "__main__":

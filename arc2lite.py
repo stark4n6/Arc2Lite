@@ -80,6 +80,88 @@ def get_forensic_type(file_path):
         return disk_image.detect(file_path)
     return None
 
+# -sig/--check-signatures: does one file's extension match what its own
+# bytes actually are. This is a small, hand-picked table rather than a full
+# file-type-ID library on purpose -- Arc2Lite adds nothing to install, and
+# these are the types a mismatch on actually matters for in a triage. Each
+# entry is (family, offset, magic bytes); a file's detected family is
+# whichever one's magic bytes are found at that offset, first match wins.
+_SIGNATURES = (
+    ("jpeg", 0, b"\xFF\xD8\xFF"),
+    ("png", 0, b"\x89PNG\r\n\x1a\n"),
+    ("gif", 0, b"GIF87a"),
+    ("gif", 0, b"GIF89a"),
+    ("bmp", 0, b"BM"),
+    ("pdf", 0, b"%PDF-"),
+    ("zip_container", 0, b"PK\x03\x04"),
+    ("zip_container", 0, b"PK\x05\x06"),
+    ("rar", 0, b"Rar!\x1a\x07\x01\x00"),
+    ("rar", 0, b"Rar!\x1a\x07\x00"),
+    ("7z", 0, b"7z\xBC\xAF\x27\x1C"),
+    ("gzip", 0, b"\x1f\x8b"),
+    ("bzip2", 0, b"BZh"),
+    ("xz", 0, b"\xfd7zXZ\x00"),
+    ("tar", 257, b"ustar"),
+    ("exe", 0, b"MZ"),
+    ("elf", 0, b"\x7fELF"),
+    ("ole_document", 0, b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"),
+    ("sqlite", 0, b"SQLite format 3\x00"),
+    ("rtf", 0, b"{\\rtf1"),
+    ("riff", 0, b"RIFF"),
+)
+# The largest (offset + magic length) above, so a caller knows how many
+# header bytes are worth reading at all.
+SIGNATURE_HEADER_SIZE = max(offset + len(magic) for _, offset, magic in _SIGNATURES)
+
+# Extensions this feature has an opinion about. An extension left out of
+# this map is one Arc2Lite has no expectation for, so it is never flagged --
+# the point is catching a mismatch with real signal (a renamed .zip pretending
+# to be a .jpg), not guessing at every extension that exists.
+_EXTENSION_FAMILY = {
+    ".jpg": "jpeg", ".jpeg": "jpeg",
+    ".png": "png",
+    ".gif": "gif",
+    ".bmp": "bmp",
+    ".pdf": "pdf",
+    ".zip": "zip_container", ".jar": "zip_container", ".apk": "zip_container",
+    ".docx": "zip_container", ".xlsx": "zip_container", ".pptx": "zip_container",
+    ".rar": "rar",
+    ".7z": "7z",
+    ".gz": "gzip", ".tgz": "gzip",
+    ".bz2": "bzip2",
+    ".xz": "xz",
+    ".tar": "tar",
+    ".exe": "exe", ".dll": "exe", ".sys": "exe",
+    ".doc": "ole_document", ".xls": "ole_document", ".ppt": "ole_document", ".msi": "ole_document",
+    ".db": "sqlite", ".sqlite": "sqlite",
+    ".rtf": "rtf",
+    ".wav": "riff", ".avi": "riff",
+}
+
+def detect_signature_family(header):
+    """The first family in _SIGNATURES whose magic bytes are present in
+    `header` at the expected offset, or None if nothing recognised matched."""
+    for family, offset, magic in _SIGNATURES:
+        if header[offset:offset + len(magic)] == magic:
+            return family
+    return None
+
+def check_signature(entry_path, header):
+    """Compare entry_path's extension against what `header` (its first
+    SIGNATURE_HEADER_SIZE-ish bytes) actually is. Returns (expected, detected)
+    if they disagree, or None if there's nothing to compare -- an extension
+    this doesn't track, or an extension whose expected family was found."""
+    if not header:
+        return None
+    ext = os.path.splitext(entry_path)[1].lower()
+    expected = _EXTENSION_FAMILY.get(ext)
+    if expected is None:
+        return None
+    detected = detect_signature_family(header)
+    if detected == expected:
+        return None
+    return (expected, detected or "unknown")
+
 def decode_extended_ts(extra_data):
     offset = 0
     length = len(extra_data)
@@ -229,6 +311,11 @@ def setup_db(cursor):
         source_file_name TEXT, source_full_path TEXT, archive_type TEXT,
         file_size_bytes INTEGER, hash_algorithm TEXT, hash_value TEXT,
         extraction_timestamp TEXT)''')
+    # Populated only when -sig/--check-signatures is used; empty otherwise,
+    # the same as image_deleted_files is empty on a volume with nothing
+    # recovered. See check_signature() for what counts as a mismatch.
+    cursor.execute('''CREATE TABLE IF NOT EXISTS signature_mismatches (
+        entry_path TEXT, file_extension TEXT, expected_type TEXT, detected_type TEXT)''')
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_ext ON file_listing (file_extension);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mod_date ON file_listing (modified_date);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_name ON file_listing (file_name);")
@@ -337,7 +424,8 @@ def calculate_hash_shared(file_path, file_name, file_id, itype, algo, update_fun
         update_func(f"    [!] Hash Error on {file_name}: {e}\n")
         return "HASH_ERROR"
 
-def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_val, update=None):
+def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_val, update=None,
+                           check_signatures=False):
     db_path = os.path.join(out_folder, f"{uid}-{os.path.basename(file_path)}_file_listing.db")
     if update is None:
         update = lambda msg, replace_last=False: None
@@ -364,7 +452,8 @@ def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_va
             # instead of behind a central directory. Same rows, same
             # table, plus the image_* tables for what a volume has and an
             # archive does not.
-            disk_image.index_image(file_path, cursor, f_type, update)
+            disk_image.index_image(file_path, cursor, f_type, update,
+                                    check_signatures=check_signature if check_signatures else None)
         elif f_type == "ZIP":
             with zipfile.ZipFile(file_path, 'r', allowZip64=True) as arc:
                 for info in arc.infolist():
@@ -380,6 +469,16 @@ def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_va
                     cursor.execute("INSERT OR IGNORE INTO file_listing VALUES (?,?,?,?,?,?,?,?,?)",
                                    (os.path.basename(info.filename), os.path.splitext(info.filename)[1], normalized_entry,
                                     format_ts(c), format_ts(m), format_ts(a), is_f, info.file_size, info.compress_size))
+                    if check_signatures and cursor.rowcount and is_f and info.file_size:
+                        try:
+                            with arc.open(info.filename) as fh:
+                                header = fh.read(SIGNATURE_HEADER_SIZE)
+                        except Exception:
+                            header = b""
+                        result = check_signature(normalized_entry, header)
+                        if result:
+                            cursor.execute("INSERT INTO signature_mismatches VALUES (?,?,?,?)",
+                                           (normalized_entry, os.path.splitext(info.filename)[1], *result))
         elif f_type in ["TAR", "GZ", "XZ"]:
             mode = "r:gz" if f_type == "GZ" else ("r:xz" if f_type == "XZ" else "r:*")
             with tarfile.open(file_path, mode, errorlevel=0) as arc:
@@ -393,6 +492,16 @@ def process_archive_logic(file_path, out_folder, uid, f_type, hash_algo, hash_va
                         cursor.execute("INSERT OR IGNORE INTO file_listing VALUES (?,?,?,?,?,?,?,?,?)",
                                        (os.path.basename(mem.name), os.path.splitext(mem.name)[1], normalized_entry,
                                         format_ts(m), format_ts(m), format_ts(m), is_f, mem.size, None))
+                        if check_signatures and cursor.rowcount and is_f and mem.size:
+                            try:
+                                fh = arc.extractfile(mem)
+                                header = fh.read(SIGNATURE_HEADER_SIZE) if fh else b""
+                            except Exception:
+                                header = b""
+                            result = check_signature(normalized_entry, header)
+                            if result:
+                                cursor.execute("INSERT INTO signature_mismatches VALUES (?,?,?,?)",
+                                               (normalized_entry, os.path.splitext(mem.name)[1], *result))
         conn.commit()
         return db_path
     except Exception as e:
@@ -435,7 +544,8 @@ def run_cli(args):
                 if itype:
                     cli_update(f"[{file_id}] [{itype}] {file}\n")
                     h_val = calculate_hash_shared(path, file, file_id, itype, args.hash, cli_update)
-                    db = process_archive_logic(path, out_root, file_id, itype, args.hash, h_val, cli_update)
+                    db = process_archive_logic(path, out_root, file_id, itype, args.hash, h_val, cli_update,
+                                                check_signatures=args.check_signatures)
                     if db:
                         apply_export_choice(db, args.export, cli_update)
 
@@ -492,6 +602,7 @@ if GUI_SUPPORT:
                 "csv": tk.BooleanVar(value=False),
                 "timeline": tk.BooleanVar(value=False),
             }
+            self.check_signatures_var = tk.BooleanVar(value=False)
             self.create_menu(); self.create_widgets()
 
         def center_window(self, win, width, height):
@@ -530,6 +641,8 @@ if GUI_SUPPORT:
             for i, (key, label) in enumerate(
                     [("sqlite", "SQLite"), ("csv", "CSV"), ("timeline", "Timeline (.body)")]):
                 ctk.CTkCheckBox(ef, text=label, variable=self.export_vars[key]).grid(row=0, column=i, padx=15)
+            ctk.CTkCheckBox(f3, text="Check file signatures (flag mismatched extensions)",
+                            variable=self.check_signatures_var).pack(pady=(0, 10))
 
             self.btn = ctk.CTkButton(self, text="Start Forensic Indexing", font=ctk.CTkFont(size=14, weight="bold"), command=self.start)
             self.btn.grid(row=3, column=0, padx=20, pady=15, sticky="ew")
@@ -577,7 +690,8 @@ if GUI_SUPPORT:
                         if itype:
                             self.log(f"[{file_id}] [{itype}] {file}\n")
                             h_val = calculate_hash_shared(p, file, file_id, itype, algo, self.log)
-                            db = process_archive_logic(p, out_root, file_id, itype, algo, h_val, self.log)
+                            db = process_archive_logic(p, out_root, file_id, itype, algo, h_val, self.log,
+                                                        check_signatures=self.check_signatures_var.get())
                             if db:
                                 apply_export_choice(db, export, self.log)
                             
@@ -650,6 +764,11 @@ if __name__ == "__main__":
                                  "'csv', and/or 'timeline' (a Sleuth Kit/mactime bodyfile). Combine "
                                  "as needed, e.g. -e sqlite csv timeline. 'timeline' only ever "
                                  "applies to an archive's or image's own database, never the master log.")
+        parser.add_argument("-sig", "--check-signatures", action="store_true",
+                            help="Flag files whose extension doesn't match their actual file type "
+                                 "(e.g. a .jpg that's really a renamed .zip). Reads a small header "
+                                 "from every file, including within disk images, so it costs real "
+                                 "time on a large input -- opt in with this flag.")
         run_cli(parser.parse_args())
     else:
         if GUI_SUPPORT: app = Arc2LiteGUI(); app.mainloop()
