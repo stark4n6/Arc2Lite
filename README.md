@@ -41,15 +41,24 @@ That is qnxprobe's `walk_all()`, and it is where most of the time went before:
 the same two acquisitions took 8.7 s and 155.0 s when the listing walked the
 directory tree, and the rows it produces are identical.
 
-Filesystems read: QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, FAT16, FAT12,
-exFAT, NTFS, HFS+, APFS, and QNX IFS boot images. Each volume is identified by its own
-on-disk structure rather than by a partition type byte.
+Filesystems read: QNX6, QNX4, ETFS, EFS, ext2/3/4, XFS, Btrfs, F2FS, FAT32, FAT16,
+FAT12, exFAT, NTFS, ReFS 3.x, HFS+, APFS, and QNX IFS boot images. Each volume is
+identified by its own on-disk structure rather than by a partition type byte. XFS,
+Btrfs and ReFS check each structure as they read it; one that fails its check is
+skipped, and the volume's `note` says how many were skipped and names the first.
 
 The logical volumes of an LVM2 physical volume are listed as volumes of their own,
 named `lvm_lba<first sector>_<group>_<volume>`. One split into runs or striped is read
 through a map of its runs and has no single place in the image, so its `lba` and
 `byte_offset` are empty and its `detail` lists each run's image offset. A RAID1 or
-mirror one is read from its first copy that is all in the image.
+mirror one is read from its first copy that is all in the image. A RAID4, RAID5,
+RAID6 or RAID10 one whose image volumes are in the image is read through a map the
+same way, and its `detail` lists where each image volume is.
+
+One disk of a RAID array holds only part of the array, and Arc2Lite reads each image
+on its own. A Linux md member is listed in `image_volumes` and not walked, with a
+note saying why. A disk with DDF or Intel RST metadata is walked only when that
+metadata records a RAID1 in its normal state, and the note says so.
 
 Two files do the reading, both vendored in `vendor/` and both pure standard
 library, so this adds nothing to install:

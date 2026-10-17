@@ -550,5 +550,111 @@ class LogicalVolumes(unittest.TestCase):
         self.assertIn("LUKS-encrypted and not read", rows[0][2])
         self.assertEqual(entries, 0)
 
+
+class XfsBtrfsRefsAndRaidMembers(unittest.TestCase):
+    """qnxprobe's own fixtures for the readers 1.68 to 1.71 add, under their
+    names there: xfs-v5-4kn (mkfs.xfs from a source tree, with that tree's
+    listing and hashes in its .known.json.gz), btrfs-zlib (mkfs.btrfs from a
+    source tree, btrfs.src.sha256 hashed from it), refs-fixture (the bytes
+    the reader reads of a volume Windows 11 wrote, with what Windows reported
+    in its .known.tsv.gz), and md-r1-0 and md-ddf-0, one member each of an md
+    RAID1 array and of a RAID5 array with DDF metadata, which mdadm wrote."""
+
+    def _listed_files(self, db):
+        return {r[0].split("/", 1)[1] for r in db.execute(
+            "SELECT entry_path FROM file_listing WHERE is_file = 1")}
+
+    def test_every_file_of_an_xfs_volume_is_listed(self):
+        with gzip.open(os.path.join(FIXTURES, "xfs-v5-4kn.known.json.gz"), "rt",
+                       encoding="utf-8") as f:
+            known = json.load(f)["entries"]
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _index(tmp, _stage(tmp, "xfs-v5-4kn"))
+            entries = {r[0].split("/", 1)[1]: r[1] for r in db.execute(
+                "SELECT entry_path, entry_type FROM image_entries")}
+            row = db.execute("SELECT filesystem, walked, note FROM image_volumes").fetchall()
+            db.close()
+        self.assertEqual(row, [("xfs", 1, "")])
+        want = {e["path"]: e["type"] for e in known}
+        self.assertEqual(len(want), 146)
+        self.assertEqual({p: {"file": "file", "dir": "dir", "symlink": "link"}.get(t, "special")
+                          for p, t in want.items()}, entries)
+
+    def test_every_file_of_a_btrfs_volume_is_listed(self):
+        with open(os.path.join(FIXTURES, "btrfs.src.sha256"), encoding="utf-8") as f:
+            want = {line.rstrip("\n").split("  ", 1)[1] for line in f if line.strip()}
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _index(tmp, _stage(tmp, "btrfs-zlib"))
+            entries = {r[0].split("/", 1)[1] for r in db.execute(
+                "SELECT entry_path FROM image_entries WHERE entry_type = 'file'")}
+            row = db.execute("SELECT filesystem, walked FROM image_volumes").fetchall()
+            db.close()
+        self.assertEqual(row, [("btrfs", 1)])
+        self.assertEqual(len(want), 572)
+        self.assertEqual(entries, want)
+
+    def test_damage_the_reader_records_while_walking_is_in_the_volume_note(self):
+        """An XFS inode that fails its CRC is skipped by the reader while the
+        volume is walked, after volumes() wrote the note; the note says so."""
+        with gzip.open(os.path.join(FIXTURES, "xfs-v5-4kn.img.gz"), "rb") as f:
+            data = bytearray(f.read())
+        walker = qnxprobe.XfsWalker(qnxprobe._XfsPatchedImage(bytes(data)), 0)
+        hello = next(n for p, n, *_r in qnxprobe.walk_all(walker) if p == "hello.txt")
+        data[walker.inode_offset(hello) + 60] ^= 0x01
+        with tempfile.TemporaryDirectory() as tmp:
+            image = os.path.join(tmp, "xfs-damaged.img")
+            with open(image, "wb") as f:
+                f.write(bytes(data))
+            db = _index(tmp, image)
+            note = db.execute("SELECT note FROM image_volumes").fetchone()[0]
+            listed = self._listed_files(db)
+            db.close()
+        self.assertNotIn("hello.txt", listed)
+        self.assertIn("1 damaged structure(s) recorded and skipped", note)
+        self.assertIn("fails its CRC", note)
+
+    def test_every_file_of_a_refs_volume_is_listed_and_its_handle_stored(self):
+        """A ReFS file's handle holds its name as stored (bytes); the walk used
+        to stop at the first file because JSON has no type for bytes."""
+        with gzip.open(os.path.join(FIXTURES, "refs-fixture.bin.gz"), "rb") as f:
+            image = qnxprobe._RefsSparseImage(f.read())
+        with gzip.open(os.path.join(FIXTURES, "refs-fixture.known.tsv.gz"), "rt",
+                       encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        head = lines[0].split("\t")
+        known = [dict(zip(head, line.split("\t"))) for line in lines[1:]]
+        db = sqlite3.connect(":memory:")
+        cur = db.cursor()
+        arc2lite.setup_db(cur)
+        disk_image.setup_image_db(cur)
+        vol = {"name": "refs", "kind": "refs", "walker": qnxprobe.RefsWalker(image, 0)}
+        counts, _dirs, basis = disk_image._index_volume(cur, vol, lambda *a, **k: None)
+        files = {r[0].split("/", 1)[1] for r in db.execute(
+            "SELECT entry_path FROM image_entries WHERE entry_type = 'file'")}
+        nodes = [json.loads(r[0]) for r in db.execute("SELECT node FROM image_entries")]
+        db.close()
+        want = {k["path"] for k in known if k["kind"] == "file"}
+        self.assertEqual(basis, disk_image.UTC)
+        self.assertEqual(len(want), 2544)
+        self.assertEqual({p for p in files if not p.startswith("System Volume Information")},
+                         want)
+        self.assertEqual(counts["file"], len(files))
+        self.assertTrue(any(isinstance(n, list) for n in nodes))
+
+    def test_one_raid_member_alone_is_listed_as_not_walked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            md = _index(tmp, _stage(tmp, "md-r1-0"))
+            md_rows = md.execute("SELECT filesystem, walked, note FROM image_volumes").fetchall()
+            md_entries = md.execute("SELECT count(*) FROM file_listing").fetchone()[0]
+            md.close()
+            ddf = _index(tmp, _stage(tmp, "md-ddf-0"))
+            ddf_rows = ddf.execute("SELECT filesystem, walked, note FROM image_volumes").fetchall()
+            ddf.close()
+        self.assertEqual(md_rows, [("linux md member", 0, disk_image.MD_MEMBER_NOTE)])
+        self.assertEqual(md_entries, 0)
+        self.assertEqual([(r[0], r[1]) for r in ddf_rows], [("raid member", 0)])
+        self.assertIn("a member of a DDF RAID set, whose array is not assembled here",
+                      ddf_rows[0][2])
+
 if __name__ == "__main__":
     unittest.main()
