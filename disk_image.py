@@ -529,6 +529,29 @@ def _encrypted_note(file_path, locked_by):
     return note
 
 
+# The filesystems whose recorded damage is a file listed as it is stored rather than
+# a structure skipped: an APFS or HFS+ file carrying a compression attribute without
+# the flag that says it is compressed (qnxprobe 1.74).
+_LISTED_DAMAGE = ("apfs", "hfs+", "hfsx")
+
+
+def _padded_note(fh):
+    """What an acquisition read with zeros while it was listed: its chunks (E01,
+    SMART, Ex01), grains (VMDK) or clusters (QCOW) whose stored data ran out before
+    the bytes they cover (ewfprobe 0.14.0's padded_chunks), or "" for none. Only the
+    units the listing read are known."""
+    units = getattr(fh, "padded_chunks", None) or []
+    if not units:
+        return ""
+    zeros = sum(u["zeros"] for u in units)
+    first = units[0]
+    return (f"{len(units):,} {first['unit']}(s) read while listing held less data than the "
+            f"bytes they cover, so the reader read {zeros:,} zero bytes in their place; "
+            f"entries listed from them can be wrong. First: {first['unit']} "
+            f"{first['index']:,} at byte {first['offset']:,}, {first['decoded']:,} of "
+            f"{first['length']:,} bytes")
+
+
 def index_image(file_path, cursor, image_type, update):
     """Walk every volume in this image into the cursor's database.
 
@@ -606,10 +629,14 @@ def index_image(file_path, cursor, image_type, update):
                     totals["walked"] += 1
                     # XFS, Btrfs and ReFS skip a structure that fails its check
                     # and record it while the volume is walked, after
-                    # volumes() wrote the note.
+                    # volumes() wrote the note. Since qnxprobe 1.74 APFS and HFS+
+                    # record a file that carries a compression attribute without
+                    # being flagged compressed; that file is listed, not skipped.
                     count, damage = qnxprobe.damage_lines(walker, 1)
                     if count and damage[0] not in note:
-                        found = (f"{count:,} damaged structure(s) recorded and skipped while "
+                        what = ("listed and recorded as damage" if vol["kind"] in _LISTED_DAMAGE
+                                else "recorded and skipped")
+                        found = (f"{count:,} damaged structure(s) {what} while "
                                  f"the volume was walked, first: {damage[0]}")
                         note = f"{note}; {found}" if note else found
                         update(f"    [!] {vol['name']}: {found}\n")
@@ -626,11 +653,14 @@ def index_image(file_path, cursor, image_type, update):
                             vol.get("missing_past_end", 0), 1 if walker is not None else 0,
                             basis, counts["file"], counts["dir"], counts["other"],
                             deleted, counts["dropped"], note))
+        padded = _padded_note(fh)
+        if padded:
+            update(f"    [!] {name}: {padded}\n")
         write_image_metadata(cursor, source_file_name=name, source_full_path=normalized_file_path,
                              image_type=image_type, media_size_bytes=media_size,
                              reader=READER, volumes_found=totals["volumes"],
                              volumes_walked=totals["walked"], extraction_timestamp=now,
-                             note="", **acq)
+                             note=padded, **acq)
     finally:
         try:
             fh.close()
