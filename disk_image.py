@@ -300,6 +300,25 @@ def setup_image_db(cursor):
 
 # -------------------------------------------------------------------- walk
 
+def _node_json(node):
+    """The reader's handle for an entry, as JSON for ``image_entries.node``.
+    A ReFS file's handle carries its name as the volume stores it (UTF-16LE
+    bytes), which JSON has no type for, so bytes are written as hex."""
+    def as_hex(value):
+        if isinstance(value, (bytes, bytearray)):
+            return value.hex()
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+    return json.dumps(node, default=as_hex)
+
+
+# A Linux md RAID member found on its own (volumes() kind "linux md member").
+# The reader's note points at assembling the array from all its members, and
+# Arc2Lite reads each image on its own.
+MD_MEMBER_NOTE = ("a member of a Linux md RAID array: the array is read from all its "
+                  "members together, and Arc2Lite reads each image on its own, so this "
+                  "region is not walked")
+
+
 def walk_volume(walker):
     """Every entry in this volume, directories included.
 
@@ -371,7 +390,7 @@ def _index_volume(cursor, vol, update):
                         0 if kind == "dir" else 1, size, None))
         if cursor.rowcount:
             cursor.execute("INSERT OR IGNORE INTO image_entries VALUES (?,?,?,?,?,?,?,?)",
-                           (normalized_entry, volume, kind, basis, json.dumps(node),
+                           (normalized_entry, volume, kind, basis, _node_json(node),
                             created, modified, accessed))
             counts["file" if kind == "file" else "dir" if kind == "dir" else "other"] += 1
         else:
@@ -566,6 +585,8 @@ def index_image(file_path, cursor, image_type, update):
             basis, counts = "", {"file": 0, "dir": 0, "other": 0, "dropped": 0}
             deleted = 0
             note = vol.get("note", "") or ""
+            if vol["kind"] == "linux md member":
+                note = MD_MEMBER_NOTE
             # A logical volume read through a map (split into runs, or striped)
             # has no single place in the image: qnxprobe gives it no LBA, its
             # base is only a placeholder, and the map says where each run is.
@@ -583,6 +604,15 @@ def index_image(file_path, cursor, image_type, update):
                     counts, dir_paths, basis = _index_volume(cursor, vol, update)
                     deleted = _index_deleted(cursor, vol, dir_paths, update)
                     totals["walked"] += 1
+                    # XFS, Btrfs and ReFS skip a structure that fails its check
+                    # and record it while the volume is walked, after
+                    # volumes() wrote the note.
+                    count, damage = qnxprobe.damage_lines(walker, 1)
+                    if count and damage[0] not in note:
+                        found = (f"{count:,} damaged structure(s) recorded and skipped while "
+                                 f"the volume was walked, first: {damage[0]}")
+                        note = f"{note}; {found}" if note else found
+                        update(f"    [!] {vol['name']}: {found}\n")
                 except Exception as exc:             # pylint: disable=broad-except
                     note = f"walk stopped: {exc}"
                     update(f"    [!] {vol['name']}: {note}\n")
