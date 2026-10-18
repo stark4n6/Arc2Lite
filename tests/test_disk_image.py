@@ -10,21 +10,24 @@ run, so nothing here writes into the checkout.
 """
 
 import gzip
+import hashlib
 import json
 import os
 import re
 import shutil
 import sqlite3
+import struct
 import sys
 import tempfile
 import unittest
+import zlib
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import arc2lite                                   # noqa: E402
 import disk_image                                 # noqa: E402
-from vendor import qnxprobe                       # noqa: E402
+from vendor import ewfprobe, qnxprobe             # noqa: E402
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
@@ -71,6 +74,47 @@ def _index(tmp, image_path):
     disk_image.index_image(image_path, cur, itype, lambda *a, **k: None)
     db.commit()
     return db
+
+
+def _ewf_section(out, name, payload, last=False):
+    start = out.tell()
+    size = ewfprobe.SECTION_SIZE + len(payload)
+    nxt = start if last else start + size
+    head = struct.pack("<16sQQ40s", name.encode("ascii").ljust(16, b"\x00"), nxt, size, b"\x00" * 40)
+    out.write(head + struct.pack("<I", zlib.adler32(head) & 0xFFFFFFFF) + payload)
+
+def _write_e01(path, data, chunk_size=32768, cut=()):
+    """Write ``data`` as a one-segment E01 and return its path. A chunk numbered in
+    ``cut`` keeps only the first half of its compressed stream, so its data runs out
+    before the bytes it covers. The layout follows ewfprobe's own test writer."""
+    data = data + b"\x00" * (-len(data) % 512)
+    chunks = [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
+    blob, entries = bytearray(), []
+    for n, chunk in enumerate(chunks):
+        rel = len(blob)
+        packed = zlib.compress(chunk, 6)
+        if n in cut:
+            entries.append(rel | 0x80000000); blob += packed[:len(packed) // 2]
+        elif len(packed) < len(chunk):
+            entries.append(rel | 0x80000000); blob += packed
+        else:
+            entries.append(rel); blob += chunk + struct.pack("<I", zlib.adler32(chunk) & 0xFFFFFFFF)
+    vol = bytearray(1052); vol[0] = 1
+    struct.pack_into("<III", vol, 4, len(chunks), chunk_size // 512, 512)
+    struct.pack_into("<Q", vol, 16, len(data) // 512); vol[52] = 1
+    with open(path, "wb") as out:
+        out.write(struct.pack("<8sBHH", ewfprobe.SIGNATURE, 1, 1, 0))
+        _ewf_section(out, "header", zlib.compress(b"1\nmain\nc\n\n"))
+        _ewf_section(out, "volume", bytes(vol))
+        base = out.tell() + ewfprobe.SECTION_SIZE
+        _ewf_section(out, "sectors", bytes(blob))
+        head = struct.pack("<IIQI", len(entries), 0, base, 0)
+        body = b"".join(struct.pack("<I", e) for e in entries)
+        _ewf_section(out, "table", head + struct.pack("<I", zlib.adler32(head) & 0xFFFFFFFF) + body
+                 + struct.pack("<I", zlib.adler32(body) & 0xFFFFFFFF))
+        _ewf_section(out, "hash", hashlib.md5(data).digest() + b"\x00" * 16)
+        _ewf_section(out, "done", b"", last=True)
+    return path
 
 
 class WalkAgreesWithTheReader(unittest.TestCase):
@@ -655,6 +699,58 @@ class XfsBtrfsRefsAndRaidMembers(unittest.TestCase):
         self.assertEqual([(r[0], r[1]) for r in ddf_rows], [("raid member", 0)])
         self.assertIn("a member of a DDF RAID set, whose array is not assembled here",
                       ddf_rows[0][2])
+
+
+class WhatTheReaderRecordsWhileListing(unittest.TestCase):
+    """qnxprobe 1.74 and ewfprobe 0.14.0 record, while an image is listed, a file
+    whose compression attribute is not flagged, and an acquisition chunk whose
+    stored data ran out. Both reach the tables."""
+
+    def test_an_unflagged_compression_attribute_is_named_in_the_volume_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = os.path.join(tmp, "decmpfs-apfs.img")
+            with gzip.open(os.path.join(FIXTURES, "decmpfs-apfs.img.gz"), "rb") as fin, \
+                    open(image, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+            db = _index(tmp, image)
+            note = db.execute("SELECT note FROM image_volumes").fetchone()[0]
+            listed = {p.split("/", 2)[2] for p in self._listed(db)}
+            db.close()
+        with open(os.path.join(FIXTURES, "decmpfs-apfs.sha256"), encoding="utf-8") as f:
+            want = {line.split(None, 2)[2].strip() for line in f
+                    if line.strip() and not line.startswith("#")}
+        # every file is listed, the two LZBITMAP files and the two unflagged ones too
+        self.assertEqual(len(want), 25)
+        self.assertLessEqual(want, listed)
+        self.assertTrue(note.startswith(
+            "2 damaged structure(s) listed and recorded as damage while the volume was "
+            "walked, first: object 68: carries a com.apple.decmpfs attribute but is not "
+            "flagged compressed"), note)
+
+    @staticmethod
+    def _listed(db):
+        return [r[0] for r in db.execute(
+            "SELECT entry_path FROM image_entries WHERE entry_type = 'file'")]
+
+    def test_a_chunk_whose_data_ran_out_is_named_in_the_image_note(self):
+        with gzip.open(os.path.join(FIXTURES, "ntfs-fixture.img.gz"), "rb") as f:
+            data = f.read()
+        with tempfile.TemporaryDirectory() as tmp:
+            whole = _write_e01(os.path.join(tmp, "whole.E01"), data)
+            db = _index(tmp, whole)
+            clean = db.execute("SELECT note FROM image_metadata").fetchone()[0]
+            db.close()
+            # chunk 3 holds $MFT records the listing reads
+            cut = _write_e01(os.path.join(tmp, "cut.E01"), data, cut=(3,))
+            db = _index(tmp, cut)
+            note = db.execute("SELECT note FROM image_metadata").fetchone()[0]
+            db.close()
+        self.assertEqual(clean, "")
+        self.assertTrue(note.startswith(
+            "1 chunk(s) read while listing held less data than the bytes they cover, so "
+            "the reader read "), note)
+        self.assertIn("First: chunk 3 at byte 98,304, ", note)
+
 
 if __name__ == "__main__":
     unittest.main()
