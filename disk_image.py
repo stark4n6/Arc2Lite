@@ -172,7 +172,9 @@ def detect(file_path):
     if not named_image and not _maybe_an_image_name(lowered):
         return None
     try:
-        segments = qnxprobe.split_segments(file_path)
+        # Unequal segments are allowed here: they are still one set, so only its
+        # first segment is claimed, and index_image() records why it is not read.
+        segments = qnxprobe.split_segments(file_path, allow_unequal=True)
     except qnxprobe.SplitImageError:
         # A set with a hole in it, or numbered inconsistently. Reported as an
         # image so index_image() records why it could not be read, rather than
@@ -183,6 +185,29 @@ def detect(file_path):
     if named_image or _locked_by(file_path):
         return "RAW"
     return "RAW" if _holds_a_volume(file_path, segments) else None
+
+
+def _split_segments(file_path):
+    """The segments of the split set ``file_path`` belongs to, as qnxprobe joins them.
+
+    Since qnxprobe 1.75 a set whose segments before the last are not one size is
+    refused: a segment cut short or padded puts every byte after it at the wrong
+    offset. qnxprobe's message offers its own --allow-unequal-segments, which
+    Arc2Lite does not have, so the refusal is said here with what to do instead.
+    """
+    try:
+        return qnxprobe.split_segments(file_path)
+    except qnxprobe.SplitSegmentSizeError as exc:
+        odd = ", ".join(f"{os.path.basename(exc.segments[i])} is {exc.sizes[i]:,} bytes"
+                        for i in exc.odd[:3])
+        raise qnxprobe.SplitImageError(
+            f"{os.path.basename(file_path)} is one segment of a split image whose "
+            f"segments are not one size: {os.path.basename(exc.segments[0])} is "
+            f"{exc.sizes[0]:,} bytes and {odd}{', ...' if len(exc.odd) > 3 else ''}. "
+            f"Not read: a segment cut short or padded would put every byte after it "
+            f"at the wrong offset. Compare the segments with the acquisition's own "
+            f"record. If the set is whole as it is, join the segments into one file "
+            f"in order and give Arc2Lite that file.") from None
 
 
 def _holds_a_volume(file_path, segments):
@@ -578,7 +603,7 @@ def index_image(file_path, cursor, image_type, update):
         return {"volumes": 0, "walked": 0, "entries": 0, "deleted": 0}
 
     try:
-        segments = qnxprobe.split_segments(file_path) if image_type == "RAW" else None
+        segments = _split_segments(file_path) if image_type == "RAW" else None
     except qnxprobe.SplitImageError as exc:
         write_image_metadata(cursor, source_file_name=name, source_full_path=normalized_file_path,
                              image_type=image_type, segments="[]", reader=READER,
