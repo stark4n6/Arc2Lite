@@ -345,6 +345,32 @@ class Detection(unittest.TestCase):
             self.assertEqual(disk_image.detect(os.path.join(tmp, "zeroed.000")), "RAW")
             self.assertIsNone(disk_image.detect(os.path.join(tmp, "zeroed.001")))
 
+    def test_a_set_of_unequal_segments_is_claimed_once_and_not_read(self):
+        """qnxprobe 1.75 refuses a set whose segments before the last are not one
+        size. The set is still claimed at its first segment only, so the refusal is
+        recorded once rather than the set passing as ordinary files, and the note
+        says what to do in Arc2Lite, not in qnxprobe."""
+        with tempfile.TemporaryDirectory() as tmp:
+            whole = _stage(tmp, "fat32-deleted")
+            with open(whole, "rb") as fh:
+                data = fh.read()
+            os.remove(whole)
+            cut = len(data) // 4
+            for i, chunk in enumerate((data[:cut], data[cut:]), start=1):
+                with open(os.path.join(tmp, f"uneven.{i:03d}"), "wb") as fh:
+                    fh.write(chunk)
+            first = os.path.join(tmp, "uneven.001")
+            self.assertEqual(disk_image.detect(first), "RAW")
+            self.assertIsNone(disk_image.detect(os.path.join(tmp, "uneven.002")))
+            db = _index(tmp, first)
+            note, walked = db.execute(
+                "SELECT note, volumes_walked FROM image_metadata").fetchone()
+            self.assertEqual(walked, 0)
+            self.assertIn("not one size", note)
+            self.assertIn("give Arc2Lite that file", note)
+            self.assertNotIn("--allow-unequal-segments", note)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM image_entries").fetchone()[0], 0)
+
     def test_only_the_first_ewf_segment_is_indexed(self):
         path = os.path.join(FIXTURES, E01_FIXTURE)
         self.assertEqual(disk_image.detect(path), "E01")
